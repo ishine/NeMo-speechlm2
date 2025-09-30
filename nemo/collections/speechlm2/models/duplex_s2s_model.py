@@ -18,7 +18,11 @@ from lightning import LightningModule
 from omegaconf import DictConfig
 from peft import PeftModel
 from torch import Tensor
-from torch.distributed.fsdp import fully_shard
+# from torch.distributed.fsdp import fully_shard
+try:
+    from torch.distributed.fsdp import fully_shard
+except Exception:
+    from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
