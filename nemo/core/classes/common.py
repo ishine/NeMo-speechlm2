@@ -583,7 +583,8 @@ class Serialization(ABC):
                 except Exception as e:
                     # report saved errors, if any, and raise
                     if prev_error:
-                        logging.error(prev_error)
+                        # Change to debug to reduce noise for expected failures
+                        logging.debug(prev_error)
                     raise e
 
         if not hasattr(instance, '_cfg'):
