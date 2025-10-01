@@ -325,6 +325,12 @@ class AudioTurn:
     audio_locator_tag: str
     text: str | None = None
 
+    def __post_init__(self):
+        # Fix for shar data: if audio data is in custom['data'], use that instead
+        if 'data' in self.cut.custom and hasattr(self.cut.custom['data'], 'sources'):
+            # Replace the placeholder recording with the actual audio data from custom field
+            self.cut.recording = self.cut.custom['data']
+
     def to_dict(self):
         assert self.cut.has_recording and self.cut.recording.sources[0].type not in {
             "shar",

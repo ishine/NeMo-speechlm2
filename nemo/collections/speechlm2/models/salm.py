@@ -160,6 +160,25 @@ class SALM(LightningModule, HFHubMixin):
             input_signal=batch["audios"], input_signal_length=batch["audio_lens"]
         )
         audio_embs = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
+
+        # Debug: Check if audio placeholders are present in input_ids
+        num_audio_placeholders = (batch["input_ids"] == self.audio_locator_tag_id).sum().item()
+        if num_audio_placeholders == 0:
+            import logging
+            logging.warning(f"WARNING: No audio placeholders found in input_ids!")
+            logging.warning(f"Audio locator tag ID: {self.audio_locator_tag_id}")
+            logging.warning(f"Batch input_ids shape: {batch['input_ids'].shape}")
+            logging.warning(f"Number of audio embeddings: {len(audio_embs)}")
+            # Log first 50 tokens to see what's there
+            if batch["input_ids"].numel() > 0:
+                sample = batch["input_ids"][0][:50] if batch["input_ids"][0].numel() > 50 else batch["input_ids"][0]
+                logging.warning(f"First 50 tokens of first sample: {sample.tolist()}")
+                try:
+                    decoded = self.tokenizer.ids_to_text(sample.tolist())
+                    logging.warning(f"Decoded text: {decoded}")
+                except:
+                    pass
+
         input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
         text_embs = self.embed_tokens(input_ids_to_embed)
         input_embs, target_ids, attention_mask = replace_placeholders_and_build_targets(

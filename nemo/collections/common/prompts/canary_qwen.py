@@ -67,24 +67,35 @@ def canary_qwen_cut_prompt_format_fn(cut: Cut, prompt: CanaryQwenPromptFormatter
     """
     if isinstance(cut, MixedCut):
         cut = cut.first_non_padding_cut
-        
+
     if cut.has_custom("context"):
         context = cut.context
     elif cut.has_custom("question"):
         context = cut.question
-    else:
+    elif hasattr(cut, "default_context"):
         context = cut.default_context
+    else:
+        # Fallback to a default ASR prompt if no context is provided
+        context = "Transcribe the following: "
+
+    # CRITICAL FIX: Add audio placeholder tag to the user message
+    # This ensures the audio placeholder token is inserted into input_ids
+    # The tag should match what's configured in the model (usually "<|audio|>")
+    audio_locator_tag = cut.custom.get("audio_locator_tag", "<|audio|>") if cut.has_custom("audio_locator_tag") else "<|audio|>"
+
+    # Append audio tag to the context
+    user_message = f"{context}{audio_locator_tag}"
 
     turns = []
-    
+
     # Add system prompt if available
     if cut.has_custom("system_prompt"):
-        turns.append({"role": "system_and_user", "slots": {"system": cut.system_prompt, "message": context}})
+        turns.append({"role": "system_and_user", "slots": {"system": cut.system_prompt, "message": user_message}})
     else:
-        turns.append({"role": "user", "slots": {"message": context}})
-    
+        turns.append({"role": "user", "slots": {"message": user_message}})
+
     # Add assistant response if available
     if (answer := cut.supervisions[0].text) is not None:
         turns.append({"role": "assistant", "slots": {"message": answer}})
-        
+
     return prompt.encode_dialog(turns)

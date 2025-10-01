@@ -65,15 +65,91 @@ class SALMDataset(torch.utils.data.Dataset):
           the variable-length audio segments that replace each audio_locator_tag token
     """
 
-    def __init__(self, tokenizer: AutoTokenizer) -> None:
+    def __init__(self, tokenizer: AutoTokenizer, prompt_format=None) -> None:
         self.tokenizer = tokenizer
         self.pad_id = get_pad_id(tokenizer)
+        self.prompt_format = prompt_format
 
     def __getitem__(self, conversations: CutSet) -> dict | None:
         # Note: the function call below may filter out some or all conversations due to audio loading issues.
         # If all conversations are filtered out, we'll return None, and expect users to wrap this dataset
         # in ``nemo.collections.common.data.fallback.FallbackDataset`` to use the previous mini-batch instead.
-        audios, audio_lens, conversations = collate_conversation_audio_fault_tolerant(conversations)
+
+        # Check if we're dealing with NeMoMultimodalConversation or raw Cuts
+        # This happens when validation dataset uses manifest files instead of shar format
+        from lhotse import CutSet
+        from nemo.collections.common.data.lhotse.text_adapters import (
+            NeMoMultimodalConversation,
+            AudioTurn,
+            TextTurn
+        )
+
+        # Convert raw cuts to NeMoMultimodalConversation if needed
+        processed_conversations = []
+        for item in conversations:
+            if isinstance(item, NeMoMultimodalConversation):
+                processed_conversations.append(item)
+            else:
+                # It's a raw Cut object, wrap it as a simple conversation
+                # This typically happens with validation datasets using manifest files
+
+                # First, apply the prompt formatter to the raw Cut object to get tokenized data
+                if self.prompt_format is not None:
+                    from nemo.collections.common.data.prompt_fn import apply_prompt_format_fn
+                    # Apply prompt formatter to the raw Cut to get input_ids with audio placeholders
+                    encoded = apply_prompt_format_fn(item, self.prompt_format)
+                    input_ids = encoded.get('input_ids', torch.tensor([], dtype=torch.long))
+                    mask = encoded.get('mask', torch.tensor([], dtype=torch.bool))
+
+                    # Debug: Verify audio tokens are present
+                    if hasattr(self.tokenizer, 'audio_locator_tag_id'):
+                        audio_tag_id = self.tokenizer.audio_locator_tag_id
+                        num_audio_tokens = (input_ids == audio_tag_id).sum().item() if torch.is_tensor(input_ids) else 0
+                        if num_audio_tokens == 0:
+                            import logging
+                            logging.debug(f"Warning: No audio tokens found in tokenized Cut {item.id}")
+                            logging.debug(f"Input IDs shape: {input_ids.shape if torch.is_tensor(input_ids) else 'not tensor'}")
+                            # Log first 50 tokens for debugging
+                            if torch.is_tensor(input_ids) and len(input_ids) > 0:
+                                logging.debug(f"First 50 tokens: {input_ids[:50].tolist()}")
+                else:
+                    # Fallback: create empty tensors if no prompt formatter available
+                    input_ids = torch.tensor([], dtype=torch.long)
+                    mask = torch.tensor([], dtype=torch.bool)
+
+                # Now create the conversation structure for compatibility
+                turns = []
+
+                # Create an audio turn for the cut
+                audio_turn = AudioTurn(
+                    cut=item,
+                    role="user",  # Default role
+                    audio_locator_tag="<|audio|>",  # Default audio tag
+                    text=None  # Optional text field
+                )
+                turns.append(audio_turn)
+
+                # Create a text turn if the cut has supervisions (transcription)
+                if item.supervisions:
+                    text = item.supervisions[0].text if item.supervisions else ""
+                    text_turn = TextTurn(
+                        value=text,
+                        role="assistant"
+                    )
+                    turns.append(text_turn)
+
+                conv = NeMoMultimodalConversation(
+                    id=item.id,
+                    turns=turns
+                )
+
+                # Set the tokenized data from the prompt formatter
+                conv.input_ids = input_ids
+                conv.mask = mask
+
+                processed_conversations.append(conv)
+
+        audios, audio_lens, conversations = collate_conversation_audio_fault_tolerant(processed_conversations)
         if not conversations:
             return None
         return {

@@ -475,6 +475,12 @@ def cut_to_conversation(
     """
     if isinstance(cut, NeMoMultimodalConversation):
         return cut
+
+    # Fix for shar data: if audio data is in custom['data'], use that instead
+    if 'data' in cut.custom and hasattr(cut.custom['data'], 'sources'):
+        # Replace the placeholder recording with the actual audio data from custom field
+        cut.recording = cut.custom['data']
+
     turns = [
         AudioTurn(cut=cut, role="user", audio_locator_tag=audio_locator_tag, text=cut.supervisions[0].text),
         TextTurn(value=cut.supervisions[0].text, role="assistant"),
@@ -546,10 +552,18 @@ def s2s_cut_to_conversation(
         output_roles: when supervision.speaker is set to one of these values, we consider it assistant's turn.
         strip_timestamp_tokens: strips tokens like <|0|>, <|1|>, etc indicating timestamps from the text.
     """
+    # Fix for shar data: if audio data is in custom['data'], use that instead
+    if 'data' in cut.custom and hasattr(cut.custom['data'], 'sources'):
+        # Replace the placeholder recording with the actual audio data from custom field
+        cut.recording = cut.custom['data']
+
     turn_cuts = cut.trim_to_supervisions(keep_overlapping=False)
     turns = []
     idx = 0
     for per_turn_cut in turn_cuts:
+        # Fix for shar data in turn cuts as well
+        if 'data' in per_turn_cut.custom and hasattr(per_turn_cut.custom['data'], 'sources'):
+            per_turn_cut.recording = per_turn_cut.custom['data']
         assert (
             len(per_turn_cut.supervisions) >= 1
         ), f"Expected at least one supervision per turn, got none in cut {cut.id}"
@@ -601,7 +615,24 @@ def _resolve_shar_inputs(path: Union[str, Path], only_metadata: bool) -> dict:
     if only_metadata:
         return dict(fields={"cuts": sorted(Path(path).glob("cuts.*"))})
     else:
-        return dict(in_dir=path)
+        # Check if this is a valid shar directory
+        path_obj = Path(path)
+        cuts_files = list(path_obj.glob("cuts.*"))
+        recording_files = list(path_obj.glob("recording.*"))
+        data_files = list(path_obj.glob("data.*"))
+
+        # If we have cuts and recording files but no data files,
+        # we need to handle this specially as lhotse expects "data" prefix for audio
+        if cuts_files and recording_files and not data_files:
+            # Use explicit fields mapping to handle recording.* files
+            fields_dict = {
+                "cuts": sorted(cuts_files),
+                "data": sorted(recording_files)  # Map recording.* to data field
+            }
+            return dict(fields=fields_dict)
+        else:
+            # Use default in_dir method for standard shar format
+            return dict(in_dir=path)
 
 
 def resolve_relative_paths(cut: Cut, manifest_path: str) -> Cut:
