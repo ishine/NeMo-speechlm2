@@ -4,7 +4,7 @@
 # Supports both single-node and multi-node training
 
 ROOT_REPO="$(pwd)"
-OUTDIR=$ROOT_REPO/scripts_CanaryQwenASR/outputs
+OUTDIR=$ROOT_REPO/recipes/CanaryQwenASR/outputs
 YAML=salm_canary_qwen_2.5b
 
 export PYTHONPATH=$ROOT_REPO
@@ -16,8 +16,8 @@ mpirun --allow-run-as-root -bind-to none -map-by slot \
     -x PATH -x PYTHONPATH -x LD_LIBRARY_PATH -x S3_ENDPOINT_URL \
     -x S3_USE_HTTPS -x S3_ENDPOINT -x AWS_SECRET_ACCESS_KEY -x AWS_ACCESS_KEY_ID -x S3_VERIFY_SSL \
     -mca pml ob1 -mca btl ^openib --hostfile /horovod/generated/hostfile -mca orte_keep_fqdn_hostnames t \
-/usr/bin/python3 $ROOT_REPO/scripts_CanaryQwenASR/speech_to_text_salm.py \
-    --config-path=$ROOT_REPO/scripts_CanaryQwenASR/configs \
+/usr/bin/python3 $ROOT_REPO/recipes/CanaryQwenASR/speech_to_text_salm.py \
+    --config-path=$ROOT_REPO/recipes/CanaryQwenASR/configs \
     --config-name=$YAML \
     exp_manager.exp_dir=$OUTDIR \
     "$@"  # Allow additional command-line overrides
