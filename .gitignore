@@ -185,6 +185,3 @@ slurm*.out
 node_modules/
 .vite/
 
-*.md
-scripts_CacheAwareStreamingASR
-scripts_ConfTransfASR
