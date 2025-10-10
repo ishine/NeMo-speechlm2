@@ -15,9 +15,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 from huggingface_hub import CONFIG_NAME, PyTorchModelHubMixin
-from huggingface_hub.hub_mixin import DataclassInstance
 from omegaconf import DictConfig, OmegaConf
 from transformers.utils import cached_file
+
+# Backward compatibility: DataclassInstance was removed in newer huggingface_hub versions
+# It's only used for type hints, so we can safely use Any as fallback
+try:
+    from huggingface_hub.hub_mixin import DataclassInstance
+except ImportError:
+    DataclassInstance = Any  # type: ignore
 
 
 class HFHubMixin(

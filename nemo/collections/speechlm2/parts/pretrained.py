@@ -139,18 +139,211 @@ def load_custom_asr_encoder_only(nemo_path: str):
         return CustomASRModel(config, state_dict)
 
 
+def _load_qwen3_as_qwen2(model_path_or_name: str, dtype=torch.float32):
+    """
+    Load Qwen3 model using Qwen2 compatibility mode.
+
+    Qwen3 and Qwen2 share nearly identical architectures, so we can load Qwen3 weights
+    into a Qwen2 model structure when the transformers library doesn't support Qwen3.
+
+    This creates a temporary modified config.json with model_type changed from 'qwen3' to 'qwen2',
+    then loads the model with that modified config.
+
+    Args:
+        model_path_or_name: Path to Qwen3 model directory
+        dtype: Model dtype for loading
+
+    Returns:
+        Loaded model with Qwen3 weights in Qwen2 architecture
+
+    Raises:
+        RuntimeError: If the model is not actually Qwen3 or if loading fails
+    """
+    import json
+    import tempfile
+    import shutil
+    from pathlib import Path
+
+    model_path = Path(model_path_or_name)
+
+    # Verify this is a local path
+    if not model_path.exists():
+        raise RuntimeError(
+            f"Qwen2 compatibility mode requires a local model directory, but path does not exist: {model_path}"
+        )
+
+    # Load original config
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        raise RuntimeError(f"Config file not found: {config_path}")
+
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+
+    # Verify this is actually Qwen3
+    original_model_type = config.get('model_type')
+    if original_model_type != 'qwen3':
+        raise RuntimeError(
+            f"Expected model_type='qwen3' but got '{original_model_type}'. "
+            f"Qwen2 compatibility mode only works for Qwen3 models."
+        )
+
+    logger.info(f"  Model type: {original_model_type} → qwen2 (compatibility mode)")
+
+    # Create temporary directory with modified config
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+
+        # Copy all files to temp directory (preserving structure)
+        logger.debug(f"  Copying model files to temporary directory...")
+        for item in model_path.iterdir():
+            if item.is_file():
+                shutil.copy2(item, tmpdir_path / item.name)
+            elif item.is_dir():
+                shutil.copytree(item, tmpdir_path / item.name)
+
+        # Modify config.json: qwen3 → qwen2
+        config['model_type'] = 'qwen2'
+        modified_config_path = tmpdir_path / "config.json"
+        with open(modified_config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+
+        logger.info(f"  Loading with Qwen2 architecture (compatible with Qwen3)...")
+
+        # Load model with modified config
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                str(tmpdir_path),
+                dtype=dtype,
+                local_files_only=True  # Don't try to download anything
+            )
+            logger.info("  ✓ Successfully loaded Qwen3 model using Qwen2 compatibility mode")
+            return model
+
+        except Exception as e:
+            logger.error(f"  Failed to load model in Qwen2 compatibility mode: {e}")
+            raise RuntimeError(
+                f"Could not load Qwen3 model even with Qwen2 compatibility. "
+                f"Please upgrade transformers: pip install --upgrade 'transformers>=4.37.0'"
+            ) from e
+
+
 def load_pretrained_hf(model_path_or_name: str, pretrained_weights: bool = True, dtype=torch.float32):
     """
-    Load pretrained HuggingFace AutoModelForCausalLM.
+    Load pretrained HuggingFace AutoModelForCausalLM with Qwen3 compatibility.
 
     Setting ``pretrained_weights=False`` returns a model that has identical architecture with the checkpoint,
     but is randomly initialized.
+
+    Enhanced with Qwen3 support:
+    - Tries trust_remote_code first for newer architectures
+    - Falls back to Qwen2 mapping for Qwen3 models (architecturally compatible)
+    - Handles dtype parameter compatibility across transformers versions
+    - Provides clear error messages for version issues
     """
     if pretrained_weights:
-        return AutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype)
+        try:
+            # First attempt: trust_remote_code with dtype for custom/newer models
+            return AutoModelForCausalLM.from_pretrained(
+                model_path_or_name,
+                dtype=dtype,
+                trust_remote_code=True
+            )
+        except TypeError as type_err:
+            # Handle dtype parameter not supported in older transformers versions
+            if "dtype" in str(type_err) or "unexpected keyword argument" in str(type_err):
+                logger.warning(
+                    f"dtype parameter not supported in current transformers version.\n"
+                    f"  Retrying without dtype parameter (will use model's default dtype)..."
+                )
+                try:
+                    return AutoModelForCausalLM.from_pretrained(
+                        model_path_or_name,
+                        trust_remote_code=True
+                    )
+                except Exception as retry_error:
+                    logger.error(f"Retry without dtype failed: {retry_error}")
+                    logger.error(
+                        "\n" + "="*80 + "\n"
+                        "SOLUTION: Upgrade transformers to support dtype parameter\n"
+                        "="*80 + "\n"
+                        "Your transformers library is too old to support dtype parameter for Qwen3.\n"
+                        "\n"
+                        "Fix by running on your GPU server:\n"
+                        "  pip install --upgrade 'transformers>=4.55.0'\n"
+                        "\n"
+                        "Or if using conda:\n"
+                        "  conda install -c conda-forge 'transformers>=4.55.0'\n"
+                        "\n"
+                        "After upgrade, restart your script.\n"
+                        "="*80
+                    )
+                    raise RuntimeError(
+                        f"Cannot load model: transformers library too old (requires >=4.55.0 for full Qwen3 support)\n"
+                        f"Original error: {type_err}"
+                    ) from type_err
+            else:
+                # Different TypeError, re-raise
+                raise
+        except (KeyError, ValueError) as e:
+            error_str = str(e).lower()
+
+            # Check if this is a Qwen3 compatibility issue
+            if 'qwen3' in error_str and 'does not recognize' in error_str:
+                logger.warning(
+                    f"Qwen3 model type not recognized by transformers library.\n"
+                    f"  Attempting Qwen2 compatibility mode (architectures are nearly identical)..."
+                )
+
+                # Try Qwen2 compatibility mode
+                try:
+                    return _load_qwen3_as_qwen2(model_path_or_name, dtype)
+                except Exception as qwen2_error:
+                    logger.error(f"Qwen2 compatibility mode failed: {qwen2_error}")
+                    logger.error(
+                        "\n" + "="*80 + "\n"
+                        "SOLUTION: Upgrade transformers to support Qwen3\n"
+                        "="*80 + "\n"
+                        "Your transformers library is too old to support Qwen3 models.\n"
+                        "\n"
+                        "Fix by running on your GPU server:\n"
+                        "  pip install --upgrade 'transformers>=4.55.0'\n"
+                        "\n"
+                        "Or if using conda:\n"
+                        "  conda install -c conda-forge 'transformers>=4.55.0'\n"
+                        "\n"
+                        "After upgrade, restart your script.\n"
+                        "="*80
+                    )
+                    raise RuntimeError(
+                        f"Cannot load Qwen3 model: transformers library too old (requires >=4.55.0)\n"
+                        f"Original error: {e}"
+                    ) from e
+            else:
+                # Different error, re-raise
+                raise
     else:
-        config = AutoConfig.from_pretrained(model_path_or_name)
-        return AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
+        try:
+            config = AutoConfig.from_pretrained(model_path_or_name, trust_remote_code=True)
+            # Try with dtype first, fall back to without dtype if not supported
+            try:
+                return AutoModelForCausalLM.from_config(config, dtype=dtype)
+            except TypeError as type_err:
+                if "dtype" in str(type_err) or "unexpected keyword argument" in str(type_err):
+                    logger.warning(
+                        f"dtype parameter not supported for from_config in current transformers version.\n"
+                        f"  Using model's default dtype instead..."
+                    )
+                    return AutoModelForCausalLM.from_config(config)
+                else:
+                    raise
+        except (KeyError, ValueError) as e:
+            if 'qwen3' in str(e).lower():
+                logger.error(
+                    "Qwen3 model type not supported. Please upgrade transformers:\n"
+                    "  pip install --upgrade 'transformers>=4.55.0'"
+                )
+            raise
 
 
 @contextmanager
