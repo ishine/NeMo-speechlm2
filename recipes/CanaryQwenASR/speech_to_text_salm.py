@@ -61,54 +61,108 @@ def get_node_count():
     return num_nodes
 
 
-BATCH_SIZE_KEY = 'batch size'
+class SALMProgressBar(TQDMProgressBar):
+    """
+    Custom progress bar for SALM training with step-based display and comprehensive metrics.
 
-class GPUUsageTQDMProgressBar(TQDMProgressBar):
-    """Custom progress bar showing GPU memory usage and formatted metrics."""
+    Displays:
+        - Step progress (step/max_steps) instead of epoch-based
+        - Training metrics: train_loss (4 decimals), lr (scientific), bs (integer)
+        - GPU memory usage
+        - Step timing
+
+    Example output:
+        Training: 23%|████| 1234/5000 [02:45<08:22, 3.5it/s, train_loss=2.1234, lr=3.00e-04, bs=4, GPU_Mem=45.23GB]
+    """
+
+    # Display format constants
+    TRAIN_BAR_FORMAT = "Training: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+    VAL_BAR_FORMAT = "Validation: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]"
+
+    # Metric format specifications
+    METRIC_FORMATS = {
+        'train_loss': lambda v: f"{v:.4f}",      # 4 decimals
+        'lr': lambda v: f"{v:.2e}",              # Scientific notation
+        'bs': lambda v: f"{int(v)}",             # Integer
+        'step_time': lambda v: f"{v:.2f}s",      # 2 decimals + unit
+    }
+
+    # Keys to remove from display
+    EXCLUDE_KEYS = {'v_num'}
+
+    # Key renames
+    KEY_RENAMES = {
+        'train_step_timing in s': 'step_time',
+        'batch size': 'bs',
+    }
 
     def init_train_tqdm(self):
-        """Override bar format to not have 's/it'."""
-        self.bar = super().init_train_tqdm()
-        self.bar.bar_format = "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]"
-        return self.bar
+        """Initialize training progress bar with custom format."""
+        bar = super().init_train_tqdm()
+        bar.bar_format = self.TRAIN_BAR_FORMAT
+        return bar
+
+    def init_validation_tqdm(self):
+        """Initialize validation progress bar with custom format."""
+        bar = super().init_validation_tqdm()
+        bar.bar_format = self.VAL_BAR_FORMAT
+        return bar
 
     def get_metrics(self, trainer, pl_module):
-        """Add GPU memory usage and format loss/lr values in scientific notation."""
+        """
+        Collect and format metrics for progress bar display.
+
+        Returns:
+            dict: Formatted metrics ready for display
+        """
         items = super().get_metrics(trainer, pl_module)
 
-        # Format loss and learning rate values
-        for key in list(items.keys()):
-            if key.startswith("loss") or key.endswith("loss") or key.startswith("lr") or key.endswith("lr"):
-                try:
-                    value = items[key]
-                    if isinstance(value, (float, int)) or (isinstance(value, torch.Tensor) and value.numel() == 1):
-                        if isinstance(value, torch.Tensor):
-                            value = value.item()
-                        items[key] = f"{value:.2e}"
-                except Exception:
-                    pass
+        # Remove excluded keys
+        for key in self.EXCLUDE_KEYS:
+            items.pop(key, None)
 
-        # Clean up display
-        items.pop("v_num", None)
+        # Rename keys
+        for old_key, new_key in self.KEY_RENAMES.items():
+            if old_key in items:
+                items[new_key] = items.pop(old_key)
 
-        # Rename step timing
-        STEP_TIME_STR = 'train_step_timing in s'
-        if STEP_TIME_STR in items:
-            step_time = items.get(STEP_TIME_STR)
-            items.pop(STEP_TIME_STR)
-            items['step_time'] = step_time
+        # Format specific metrics
+        for metric_key, format_fn in self.METRIC_FORMATS.items():
+            if metric_key in items:
+                items[metric_key] = format_fn(self._extract_value(items[metric_key]))
 
-        # Format batch size
-        if BATCH_SIZE_KEY in items:
-            items[BATCH_SIZE_KEY] = f"{int(items[BATCH_SIZE_KEY])}"
+        # Format generic loss/lr metrics (backward compatibility)
+        self._format_loss_lr_metrics(items)
 
         # Add GPU memory usage
-        if torch.cuda.is_available():
-            free, total = torch.cuda.mem_get_info()
-            mem_used_GB = (total - free) / 1024**3
-            items["GPU_Mem"] = f"{mem_used_GB:.2f}GB"
+        self._add_gpu_memory(items)
 
         return items
+
+    # Helper methods
+    @staticmethod
+    def _extract_value(value):
+        """Extract numeric value from Tensor or scalar."""
+        return value.item() if isinstance(value, torch.Tensor) else value
+
+    def _format_loss_lr_metrics(self, items):
+        """Format loss and learning rate metrics with scientific notation."""
+        for key in list(items.keys()):
+            if key not in self.METRIC_FORMATS:
+                if key.startswith(("loss", "lr")) or key.endswith(("loss", "lr")):
+                    try:
+                        value = self._extract_value(items[key])
+                        items[key] = f"{value:.2e}"
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+
+    @staticmethod
+    def _add_gpu_memory(items):
+        """Add GPU memory usage to metrics if CUDA is available."""
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            mem_used_gb = (total - free) / (1024 ** 3)
+            items["GPU_Mem"] = f"{mem_used_gb:.2f}GB"
 
 
 @hydra_runner(
@@ -156,7 +210,7 @@ def main(cfg: DictConfig):
         logging.info(f"Training Configuration: {cfg.trainer.devices} GPU(s) on {nodes} node(s)")
 
     # Initialize trainer with custom progress bar
-    trainer = Trainer(**trainer_cfg, callbacks=[GPUUsageTQDMProgressBar()])
+    trainer = Trainer(**trainer_cfg, callbacks=[SALMProgressBar()])
 
     # Setup experiment manager
     exp_manager(trainer, cfg.get("exp_manager", None))
