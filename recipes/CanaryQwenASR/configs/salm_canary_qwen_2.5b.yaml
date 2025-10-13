@@ -100,11 +100,14 @@ trainer:
   num_nodes: -1  # Auto-detect number of nodes (via MPI)
   precision: bf16-true  # Mixed precision training
 
-  # Training configuration - Official: 90k steps on 32 GPUs
-  max_steps: 90000  # Official training steps
-  limit_train_batches: 2000  # Steps per "epoch"
-  val_check_interval: 1000  # Validate every 1000 steps
-  limit_val_batches: 50
+  # Training configuration - Step-based (no epochs)
+  max_steps: 90000  # Total training steps (global step counter)
+  max_epochs: 1     # Single epoch for step-based training
+  val_check_interval: 1000  # Validate every 1000 steps (global steps)
+  limit_val_batches: 50     # Validation batches per validation run
+
+  # Note: limit_train_batches removed to enable continuous step-based training
+  # Progress bar will show: "step/max_steps" instead of "Epoch X: step/epoch_steps"
 
   # Gradient accumulation for effective batch size increase
   # With batch_tokens=3500 and accumulate_grad_batches=1, effective batch = 3500 tokens
