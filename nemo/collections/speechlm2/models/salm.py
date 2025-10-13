@@ -17,6 +17,7 @@ from itertools import repeat
 from pathlib import Path
 from typing import Any, Optional
 
+import editdistance
 import torch
 from lhotse import CutSet
 from lightning import LightningModule
@@ -39,6 +40,7 @@ from torch.distributed.tensor.parallel import (
 )
 from transformers import GenerationConfig
 
+from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.common.prompts import PromptFormatter
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.salm_dataset import left_collate_vectors
@@ -232,25 +234,38 @@ class SALM(LightningModule, HFHubMixin):
             )
 
         B, T = inputs["input_embeds"].shape[:2]
+        learning_rate = torch.as_tensor(
+            self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0
+        )
+
         ans = {
             "loss": loss,
-            "learning_rate": (
-                torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)
-            ),
+            "learning_rate": learning_rate,
             "batch_size": B,
             "sequence_length": T,
             "num_frames": num_frames.to(torch.float32),  # avoid warning
             "target_to_input_ratio": num_frames / (B * T),
             "padding_ratio": (batch["input_ids"] != self.text_pad_id).long().sum() / batch["input_ids"].numel(),
         }
-        self.log_dict(ans, on_step=True)
+
+        # Log all metrics to TensorBoard
+        self.log_dict(ans, on_step=True, prog_bar=False)
+
+        # Log key metrics to progress bar (logger=False to avoid duplicate logging to TensorBoard)
+        self.log("train_loss", loss, on_step=True, prog_bar=True, logger=False)
+        self.log("lr", learning_rate, on_step=True, prog_bar=True, logger=False)
+        self.log("bs", B, on_step=True, prog_bar=True, logger=False)
+
         return ans
 
     def on_validation_epoch_start(self) -> None:
         self._partial_val_losses = defaultdict(list)
         self._partial_accuracies = defaultdict(list)
+        self._partial_wer_nums = defaultdict(list)  # WER numerator (edit distance)
+        self._partial_wer_denoms = defaultdict(list)  # WER denominator (word count)
 
     def on_validation_epoch_end(self) -> None:
+        # Aggregate val_loss
         val_losses = []
         for name, vals in self._partial_val_losses.items():
             val_loss = torch.stack(vals).mean()
@@ -258,6 +273,7 @@ class SALM(LightningModule, HFHubMixin):
             val_losses.append(val_loss)
         self.log("val_loss", torch.stack(val_losses).mean(), on_epoch=True, sync_dist=True)
 
+        # Aggregate val_acc
         accuracies = []
         for name, accs in self._partial_accuracies.items():
             val_acc = torch.stack(accs).mean()
@@ -265,8 +281,38 @@ class SALM(LightningModule, HFHubMixin):
             accuracies.append(val_acc)
         self.log("val_acc", torch.stack(accuracies).mean(), on_epoch=True, sync_dist=True)
 
+        # Aggregate val_wer with proper distributed training support
+        # Follow the pattern from transformer_bpe_models.py (Lines 529-541)
+        wers = []
+        for name in self._partial_wer_nums.keys():
+            # Sum across all validation steps in this GPU
+            wer_num = torch.stack(self._partial_wer_nums[name]).sum()
+            wer_denom = torch.stack(self._partial_wer_denoms[name]).sum()
+
+            # All-reduce across all GPUs to get global sum
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(wer_num, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(wer_denom, op=torch.distributed.ReduceOp.SUM)
+
+            # Compute WER = total_edit_distance / total_word_count
+            if wer_denom > 0:
+                wer = wer_num / wer_denom
+            else:
+                wer = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+
+            # Log WER (already globally aggregated, so sync_dist=False)
+            self.log(f"val_wer_{name}", wer, on_epoch=True, sync_dist=False)
+            wers.append(wer)
+
+        # Log overall WER (average across datasets)
+        if len(wers) > 0:
+            self.log("val_wer", torch.stack(wers).mean(), on_epoch=True, sync_dist=False)
+
+        # Clear tracking dictionaries
         self._partial_val_losses.clear()
         self._partial_accuracies.clear()
+        self._partial_wer_nums.clear()
+        self._partial_wer_denoms.clear()
 
     def validation_step(self, batch: dict, batch_idx: int):
         for name, dataset_batch in batch.items():
@@ -286,14 +332,59 @@ class SALM(LightningModule, HFHubMixin):
                     / num_frames
                 )
 
+            # Token-level accuracy
             preds = forward_outputs["logits"].argmax(dim=-1).view(-1)
             refs = inputs["target_ids"].reshape(-1)
             preds = preds[refs != -100]
             refs = refs[refs != -100]
             accuracy = preds.eq(refs).float().mean()
 
+            # WER calculation
+            pred_ids_2d = forward_outputs["logits"].argmax(dim=-1)  # (B, T)
+            target_ids_2d = inputs["target_ids"]  # (B, T)
+
+            hypotheses = []
+            references = []
+            for i in range(pred_ids_2d.shape[0]):
+                # Get valid positions (not padding/ignore_index)
+                valid_mask = target_ids_2d[i] != -100
+                if valid_mask.sum() == 0:
+                    continue
+
+                # Extract valid token IDs
+                pred_tokens = pred_ids_2d[i][valid_mask].cpu().tolist()
+                ref_tokens = target_ids_2d[i][valid_mask].cpu().tolist()
+
+                # Decode to text
+                hypothesis = self.tokenizer.ids_to_text(pred_tokens)
+                reference = self.tokenizer.ids_to_text(ref_tokens)
+
+                hypotheses.append(hypothesis)
+                references.append(reference)
+
+            # Compute WER if we have valid samples
+            if len(hypotheses) > 0:
+                # word_error_rate returns: wer = edit_distance / num_words
+                # We need numerator and denominator for proper distributed aggregation
+                wer_scores = 0
+                wer_words = 0
+                for h, r in zip(hypotheses, references):
+                    r_words = r.split()
+                    wer_words += len(r_words)
+                    # Compute edit distance
+                    h_words = h.split()
+                    wer_scores += editdistance.eval(h_words, r_words)
+
+                wer_num = torch.tensor(wer_scores, device=self.device, dtype=torch.float32)
+                wer_denom = torch.tensor(wer_words, device=self.device, dtype=torch.float32)
+            else:
+                wer_num = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                wer_denom = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+
             self._partial_accuracies[name].append(accuracy)
             self._partial_val_losses[name].append(loss)
+            self._partial_wer_nums[name].append(wer_num)
+            self._partial_wer_denoms[name].append(wer_denom)
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
