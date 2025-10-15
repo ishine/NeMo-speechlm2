@@ -22,6 +22,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.speechlm2.modules import AudioPerceptionModule
+from torch import nn
 
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.tts.models import AudioCodecModel
@@ -360,6 +361,282 @@ def move_embedding(model):
         del model.llm.model.embed_tokens
 
 
+def _reconstruct_perception_from_state_dict(perception_state_dict: dict, output_dim: int):
+    """
+    Reconstruct perception module from state_dict when config is incomplete.
+
+    This function provides a fallback when checkpoint's perception config is missing
+    preprocessor/encoder subconfigs. It uses a public ASR model to get the config structure,
+    then loads the checkpoint weights.
+
+    Args:
+        perception_state_dict: Perception weights from checkpoint
+        output_dim: LLM hidden size for perception output projection
+
+    Returns:
+        AudioPerceptionModule with checkpoint weights loaded
+    """
+    logger.info("Loading config from public ASR model: nvidia/canary-1b-v2")
+
+    # Suppress ASR model's tokenizer initialization log
+    asr_logger = logging.getLogger("nemo.collections.asr")
+    original_level = asr_logger.level
+    asr_logger.setLevel(logging.WARNING)
+
+    try:
+        # Load public ASR model to get config structure
+        asr = load_pretrained_nemo(ASRModel, 'nvidia/canary-1b-v2').eval()
+
+        # Create perception config from ASR model
+        from omegaconf import DictConfig, OmegaConf
+
+        perception_cfg = {
+            'preprocessor': OmegaConf.to_container(asr.cfg.preprocessor, resolve=True),
+            'encoder': OmegaConf.to_container(asr.cfg.encoder, resolve=True),
+            'modality_adapter': {
+                '_target_': 'nemo.collections.asr.modules.ConformerEncoder',
+                'feat_in': asr.cfg.encoder.d_model,
+                'd_model': asr.cfg.encoder.d_model,
+                'n_layers': 2,  # Typical modality adapter depth
+                'subsampling_factor': 1,
+            },
+            'output_dim': output_dim,
+        }
+
+        perception_cfg = DictConfig(perception_cfg)
+
+        logger.info("Creating AudioPerceptionModule with reconstructed config")
+        perception = AudioPerceptionModule(perception_cfg).train()
+
+        # Load checkpoint weights
+        missing_keys, unexpected_keys = perception.load_state_dict(perception_state_dict, strict=False)
+
+        if missing_keys:
+            logger.warning(f"  - Missing keys during reconstruction: {len(missing_keys)}")
+            for key in missing_keys[:3]:
+                logger.warning(f"      {key}")
+            if len(missing_keys) > 3:
+                logger.warning(f"      ... +{len(missing_keys)-3} more")
+
+        if unexpected_keys:
+            logger.warning(f"  - Unexpected keys during reconstruction: {len(unexpected_keys)}")
+            for key in unexpected_keys[:3]:
+                logger.warning(f"      {key}")
+            if len(unexpected_keys) > 3:
+                logger.warning(f"      ... +{len(unexpected_keys)-3} more")
+
+        return perception
+
+    except Exception as e:
+        logger.error(f"Failed to reconstruct perception from public ASR model: {e}")
+        logger.error(
+            "\n" + "="*80 + "\n"
+            "SOLUTION: Checkpoint has incomplete perception config\n"
+            "="*80 + "\n"
+            "Your checkpoint is missing preprocessor/encoder config in perception.\n"
+            "\n"
+            "Possible fixes:\n"
+            "1. Use a complete checkpoint with full perception config\n"
+            "2. Ensure network access to download nvidia/canary-1b-v2 for config\n"
+            "3. Provide pretrained_asr parameter explicitly in your config\n"
+            "="*80
+        )
+        raise RuntimeError(
+            f"Cannot reconstruct perception module from incomplete checkpoint.\n"
+            f"Original error: {e}"
+        ) from e
+    finally:
+        # Restore original logging level
+        asr_logger.setLevel(original_level)
+
+
+def _load_perception_config_from_external(config_path: str, output_dim: int) -> dict:
+    """
+    Load perception config from external source (ASR training config YAML or pretrained ASR .nemo).
+
+    This function provides a fallback when checkpoint's perception config is incomplete.
+    It supports two input formats:
+    1. ASR training config YAML file: Extracts preprocessor/encoder from ASR training config
+       (e.g., recipes/ConfTransfASR/configs/fast-conformer_hybrid_transformer_ctc_bpe_eos_bos_vocab32k_lr4.yaml)
+    2. Pretrained ASR .nemo file: Loads ASR model and extracts preprocessor/encoder configs
+
+    NOTE: This requires **ASR training config**, not SALM training config!
+          SALM training config only has 'pretrained_asr' path without actual preprocessor/encoder configs.
+
+    Args:
+        config_path: Path to ASR training config YAML or pretrained ASR .nemo file
+        output_dim: LLM hidden size for perception output projection
+
+    Returns:
+        Complete perception config dict with preprocessor, encoder, modality_adapter, output_dim
+
+    Raises:
+        RuntimeError: If config_path doesn't exist or has invalid format
+        ValueError: If perception config cannot be extracted from the file
+
+    Examples:
+        # From ASR training config YAML
+        cfg = _load_perception_config_from_external(
+            "recipes/ConfTransfASR/configs/fast-conformer_hybrid_transformer_ctc_bpe_eos_bos_vocab32k_lr4.yaml",
+            2560
+        )
+
+        # From pretrained ASR .nemo file
+        cfg = _load_perception_config_from_external("nvidia/canary-1b-v2", 2560)
+
+        # From local ASR .nemo file
+        cfg = _load_perception_config_from_external("/path/to/canary-1b-v2.nemo", 2560)
+    """
+    from omegaconf import OmegaConf, DictConfig
+    from pathlib import Path
+
+    config_path_obj = Path(config_path)
+
+    # Validate input path for local files
+    if not config_path.startswith('nvidia/') and not config_path_obj.exists():
+        raise RuntimeError(
+            f"External config path does not exist: {config_path}\n"
+            f"Please provide a valid path to:\n"
+            f"  - ASR training config YAML file (e.g., recipes/ConfTransfASR/configs/fast-conformer_hybrid_transformer_ctc_bpe_eos_bos_vocab32k_lr4.yaml)\n"
+            f"  - Pretrained ASR .nemo file (e.g., /path/to/model.nemo)\n"
+            f"  - HuggingFace model name (e.g., nvidia/canary-1b-v2)\n"
+            f"\n"
+            f"NOTE: This should be an ASR training config, not a SALM training config.\n"
+            f"      SALM training config only has 'pretrained_asr' path, not the actual ASR config."
+        )
+
+    # Case 1: ASR training config YAML file
+    if config_path_obj.suffix in ['.yaml', '.yml']:
+        logger.info(f"Loading perception config from ASR training config YAML: {config_path}")
+
+        try:
+            cfg = OmegaConf.load(config_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load YAML config from {config_path}: {e}") from e
+
+        # Extract preprocessor and encoder from ASR training config
+        # Expected structure: cfg.model.preprocessor and cfg.model.encoder
+        preprocessor_cfg = None
+        encoder_cfg = None
+
+        if 'model' in cfg:
+            if 'preprocessor' in cfg.model and cfg.model.preprocessor is not None:
+                preprocessor_cfg = cfg.model.preprocessor
+            if 'encoder' in cfg.model and cfg.model.encoder is not None:
+                encoder_cfg = cfg.model.encoder
+
+        # Also check top-level keys (alternative structure)
+        if preprocessor_cfg is None and 'preprocessor' in cfg and cfg.preprocessor is not None:
+            preprocessor_cfg = cfg.preprocessor
+        if encoder_cfg is None and 'encoder' in cfg and cfg.encoder is not None:
+            encoder_cfg = cfg.encoder
+
+        # Validate both are present
+        if preprocessor_cfg is None:
+            raise ValueError(
+                f"Could not find preprocessor config in ASR training config YAML: {config_path}\n"
+                f"Expected config structure (ASR training config):\n"
+                f"  model:\n"
+                f"    preprocessor:\n"
+                f"      _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor\n"
+                f"      ...\n"
+                f"    encoder:\n"
+                f"      _target_: nemo.collections.asr.modules.ConformerEncoder\n"
+                f"      ...\n"
+                f"\n"
+                f"NOTE: This should be an ASR training config, not a SALM training config.\n"
+                f"      SALM training config only has 'pretrained_asr' path, not the actual ASR config."
+            )
+
+        if encoder_cfg is None:
+            raise ValueError(
+                f"Could not find encoder config in ASR training config YAML: {config_path}\n"
+                f"Expected config structure (ASR training config):\n"
+                f"  model:\n"
+                f"    encoder:\n"
+                f"      _target_: nemo.collections.asr.modules.ConformerEncoder\n"
+                f"      ...\n"
+                f"\n"
+                f"NOTE: This should be an ASR training config, not a SALM training config."
+            )
+
+        # Create perception config from ASR config
+        perception_dict = {
+            'preprocessor': OmegaConf.to_container(preprocessor_cfg, resolve=True),
+            'encoder': OmegaConf.to_container(encoder_cfg, resolve=True),
+            'output_dim': output_dim,
+        }
+
+        # Create default modality adapter based on encoder d_model
+        encoder_d_model = perception_dict['encoder'].get('d_model', 1024)
+        perception_dict['modality_adapter'] = {
+            '_target_': 'nemo.collections.asr.modules.ConformerEncoder',
+            'feat_in': encoder_d_model,
+            'd_model': encoder_d_model,
+            'n_layers': 2,  # Default adapter depth
+            'subsampling_factor': 1,
+        }
+
+        logger.info("✓ Successfully loaded perception config from ASR training YAML")
+        logger.info(f"  - preprocessor: {perception_dict['preprocessor'].get('_target_', 'unknown')}")
+        logger.info(f"  - encoder: {perception_dict['encoder'].get('_target_', 'unknown')}")
+        logger.info(f"  - encoder d_model: {encoder_d_model}")
+        logger.info(f"  - output_dim: {output_dim}")
+
+        return perception_dict
+
+    # Case 2: Pretrained ASR .nemo file (local path or HuggingFace model name)
+    else:
+        logger.info(f"Loading perception config from pretrained ASR model: {config_path}")
+
+        # Suppress ASR model's tokenizer initialization log
+        asr_logger = logging.getLogger("nemo.collections.asr")
+        original_level = asr_logger.level
+        asr_logger.setLevel(logging.WARNING)
+
+        try:
+            # Load ASR model
+            asr = load_pretrained_nemo(ASRModel, config_path).eval()
+
+            # Extract preprocessor and encoder configs
+            perception_dict = {
+                'preprocessor': OmegaConf.to_container(asr.cfg.preprocessor, resolve=True),
+                'encoder': OmegaConf.to_container(asr.cfg.encoder, resolve=True),
+                'output_dim': output_dim,
+            }
+
+            # If modality_adapter exists in original config, preserve it
+            # Otherwise, create a default one based on encoder output dimension
+            if hasattr(asr.cfg, 'modality_adapter'):
+                perception_dict['modality_adapter'] = OmegaConf.to_container(asr.cfg.modality_adapter, resolve=True)
+            else:
+                # Create default modality adapter config
+                perception_dict['modality_adapter'] = {
+                    '_target_': 'nemo.collections.asr.modules.ConformerEncoder',
+                    'feat_in': asr.cfg.encoder.d_model,
+                    'd_model': asr.cfg.encoder.d_model,
+                    'n_layers': 2,  # Default adapter depth
+                    'subsampling_factor': 1,
+                }
+
+            logger.info("✓ Successfully loaded perception config from ASR model")
+            logger.info(f"  - preprocessor: {perception_dict['preprocessor'].get('_target_', 'unknown')}")
+            logger.info(f"  - encoder: {perception_dict['encoder'].get('_target_', 'unknown')}")
+            logger.info(f"  - output_dim: {output_dim}")
+
+            return perception_dict
+
+        except Exception as e:
+            logger.error(f"Failed to load ASR model from {config_path}: {e}")
+            raise RuntimeError(
+                f"Cannot load perception config from ASR model: {config_path}\n"
+                f"Original error: {e}"
+            ) from e
+        finally:
+            # Restore original logging level
+            asr_logger.setLevel(original_level)
+
+
 def setup_audio_codec(model: torch.nn.Module):
     """
     Sets up an ``AudioCodecModel``, initializing it from pretrained weights.
@@ -376,14 +653,228 @@ def setup_audio_codec(model: torch.nn.Module):
     del model.audio_codec.discriminator  # free up some memory
 
 
-def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True):
+def setup_speech_encoder(
+    model: torch.nn.Module,
+    pretrained_weights: bool = True,
+    checkpoint_path: str = None,
+    external_config_path: str = None
+):
     """
     Sets up an ``AudioPerceptionModule``, initializing its ``encoder`` and ``preprocessor``
-    with a pretrained NeMo ``ASRModel``.
+    with a pretrained NeMo ``ASRModel`` or from a checkpoint.
     The result is assigned to ``model.perception`` attribute and is trainable.
 
-    Enhanced with better error handling and fallback options.
+    Enhanced with checkpoint-only loading support and external config fallback for offline inference.
+
+    Args:
+        model: SALM model instance to setup perception module for
+        pretrained_weights: Whether to load pretrained weights (default: True)
+        checkpoint_path: Optional path to SALM checkpoint for direct perception loading.
+                        If provided, loads perception config and weights from checkpoint,
+                        bypassing pretrained_asr file requirement. This enables offline
+                        inference with only the checkpoint file.
+        external_config_path: Optional path to external config source for incomplete checkpoints.
+                             Supports two formats:
+                             1. ASR training config YAML file (e.g., recipes/ConfTransfASR/configs/fast-conformer_hybrid_transformer_ctc_bpe_eos_bos_vocab32k_lr4.yaml)
+                             2. Pretrained ASR .nemo file or HuggingFace model (e.g., nvidia/canary-1b-v2)
+                             Used as fallback when checkpoint's perception config is incomplete.
+
+                             NOTE: This should be an ASR training config, not a SALM training config.
+                                   SALM training config only has 'pretrained_asr' path without actual preprocessor/encoder configs.
+
+    Modes:
+        1. Checkpoint mode (checkpoint_path provided):
+           - Extracts perception config from checkpoint
+           - If config incomplete and external_config_path provided:
+             → Loads complete config from external source
+             → Merges with checkpoint config (preserves modality_adapter if present)
+           - If config incomplete and no external_config_path:
+             → Falls back to reconstructing from state_dict using public ASR model
+           - Initializes AudioPerceptionModule with complete config
+           - Loads perception weights from checkpoint state_dict
+           - ✓ No pretrained_asr file needed (offline-friendly with external config)
+
+        2. Pretrained mode (pretrained_weights=True, no checkpoint_path):
+           - Loads ASR model from cfg.pretrained_asr
+           - Extracts config and weights from ASR model
+           - Standard training workflow
+
+        3. Random init mode (pretrained_weights=False):
+           - Not yet supported, raises NotImplementedError
+
+    Examples:
+        # Standard checkpoint loading (complete config)
+        setup_speech_encoder(model, checkpoint_path="checkpoint.ckpt")
+
+        # Checkpoint with external ASR training config
+        setup_speech_encoder(
+            model,
+            checkpoint_path="checkpoint.ckpt",
+            external_config_path="recipes/ConfTransfASR/configs/fast-conformer_hybrid_transformer_ctc_bpe_eos_bos_vocab32k_lr4.yaml"
+        )
+
+        # Checkpoint with external ASR .nemo file
+        setup_speech_encoder(
+            model,
+            checkpoint_path="checkpoint.ckpt",
+            external_config_path="/path/to/canary-1b-v2.nemo"
+        )
+
+        # Checkpoint with HuggingFace ASR model
+        setup_speech_encoder(
+            model,
+            checkpoint_path="checkpoint.ckpt",
+            external_config_path="nvidia/canary-1b-v2"
+        )
     """
+    # Mode 1: Checkpoint-only loading (offline inference)
+    if checkpoint_path is not None:
+        logger.info(f"Setting up speech encoder from checkpoint: {checkpoint_path}")
+
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+        # Extract perception config from checkpoint
+        if 'hyper_parameters' not in checkpoint or 'cfg' not in checkpoint['hyper_parameters']:
+            raise RuntimeError(
+                f"Checkpoint does not contain hyperparameters/config: {checkpoint_path}\n"
+                f"This checkpoint may be corrupted or in an unexpected format."
+            )
+
+        ckpt_cfg = checkpoint['hyper_parameters']['cfg']
+
+        if 'perception' not in ckpt_cfg or ckpt_cfg['perception'] is None:
+            raise RuntimeError(
+                f"Checkpoint config does not contain perception configuration.\n"
+                f"This checkpoint may not be a SALM model checkpoint."
+            )
+
+        # Extract perception weights from checkpoint
+        perception_state_dict = {}
+        for key, value in checkpoint['state_dict'].items():
+            if key.startswith('perception.'):
+                # Remove 'perception.' prefix
+                new_key = key[len('perception.'):]
+                perception_state_dict[new_key] = value
+
+        if not perception_state_dict:
+            raise RuntimeError(
+                f"No perception weights found in checkpoint.\n"
+                f"Checkpoint may not contain trained perception module."
+            )
+
+        # Check if perception config is complete
+        perception_cfg = ckpt_cfg['perception']
+        has_preprocessor = 'preprocessor' in perception_cfg and perception_cfg['preprocessor'] is not None
+        has_encoder = 'encoder' in perception_cfg and perception_cfg['encoder'] is not None
+
+        if not has_preprocessor or not has_encoder:
+            logger.warning("⚠ Checkpoint perception config is INCOMPLETE")
+            logger.warning("  - preprocessor config: %s", "PRESENT" if has_preprocessor else "MISSING")
+            logger.warning("  - encoder config: %s", "PRESENT" if has_encoder else "MISSING")
+
+            # Try external config first (if provided)
+            if external_config_path is not None:
+                logger.info(f"Loading perception config from external source: {external_config_path}")
+
+                try:
+                    # Load complete config from external source
+                    output_dim = model.llm.config.hidden_size if hasattr(model, 'llm') else 2560
+                    external_cfg = _load_perception_config_from_external(external_config_path, output_dim)
+
+                    # Merge with checkpoint config: use external for preprocessor/encoder,
+                    # preserve checkpoint's modality_adapter if present
+                    from omegaconf import DictConfig
+
+                    complete_cfg = {
+                        'preprocessor': external_cfg['preprocessor'],
+                        'encoder': external_cfg['encoder'],
+                        'output_dim': external_cfg['output_dim'],
+                    }
+
+                    # Preserve modality_adapter from checkpoint if it exists
+                    if 'modality_adapter' in perception_cfg and perception_cfg['modality_adapter'] is not None:
+                        logger.info("  - Preserving modality_adapter config from checkpoint")
+                        complete_cfg['modality_adapter'] = perception_cfg['modality_adapter']
+                    elif 'modality_adapter' in external_cfg:
+                        logger.info("  - Using modality_adapter config from external source")
+                        complete_cfg['modality_adapter'] = external_cfg['modality_adapter']
+
+                    # Create AudioPerceptionModule with complete config
+                    complete_cfg = DictConfig(complete_cfg)
+                    model.perception = AudioPerceptionModule(complete_cfg).train()
+
+                    # Load checkpoint weights
+                    missing_keys, unexpected_keys = model.perception.load_state_dict(perception_state_dict, strict=False)
+
+                    logger.info("✓ Perception module loaded with external config")
+                    logger.info(f"  - Perception parameters: {sum(p.numel() for p in model.perception.parameters()):,}")
+
+                    if missing_keys:
+                        logger.warning(f"  - Missing keys: {len(missing_keys)}")
+                        for key in missing_keys[:3]:
+                            logger.warning(f"      {key}")
+                        if len(missing_keys) > 3:
+                            logger.warning(f"      ... +{len(missing_keys)-3} more")
+
+                    if unexpected_keys:
+                        logger.warning(f"  - Unexpected keys: {len(unexpected_keys)}")
+                        for key in unexpected_keys[:3]:
+                            logger.warning(f"      {key}")
+                        if len(unexpected_keys) > 3:
+                            logger.warning(f"      ... +{len(unexpected_keys)-3} more")
+
+                    return
+
+                except Exception as e:
+                    logger.error(f"Failed to load external config: {e}")
+                    logger.warning("Falling back to state_dict reconstruction...")
+                    # Continue to fallback method below
+
+            # Fallback: Reconstruct perception module from state_dict structure
+            logger.info("Attempting to reconstruct perception from state_dict...")
+            model.perception = _reconstruct_perception_from_state_dict(
+                perception_state_dict,
+                model.llm.config.hidden_size if hasattr(model, 'llm') else 2560
+            )
+
+            logger.info(f"✓ Perception module reconstructed from state_dict")
+            logger.info(f"  - Perception parameters: {sum(p.numel() for p in model.perception.parameters()):,}")
+            return
+
+        # Normal path: Complete config available
+        logger.info("Initializing AudioPerceptionModule from checkpoint config")
+
+        # Store perception config in model.cfg for AudioPerceptionModule initialization
+        with open_dict(model.cfg):
+            model.cfg.perception = perception_cfg
+
+        # Create AudioPerceptionModule with proper config (same as Mode 2)
+        model.perception = AudioPerceptionModule(model.cfg.perception).train()
+
+        # Load perception weights from checkpoint state_dict
+        missing_keys, unexpected_keys = model.perception.load_state_dict(perception_state_dict, strict=False)
+
+        logger.info(f"✓ Perception module loaded from checkpoint")
+        logger.info(f"  - Perception parameters: {sum(p.numel() for p in model.perception.parameters()):,}")
+
+        if missing_keys:
+            logger.warning(f"  - Missing keys: {len(missing_keys)}")
+            for key in missing_keys[:3]:
+                logger.warning(f"      {key}")
+            if len(missing_keys) > 3:
+                logger.warning(f"      ... +{len(missing_keys)-3} more")
+
+        if unexpected_keys:
+            logger.warning(f"  - Unexpected keys: {len(unexpected_keys)}")
+            for key in unexpected_keys[:3]:
+                logger.warning(f"      {key}")
+            if len(unexpected_keys) > 3:
+                logger.warning(f"      ... +{len(unexpected_keys)-3} more")
+
+        return
+
+    # Mode 2: Standard pretrained loading (training workflow)
     if pretrained_weights:
         # Temporarily suppress ASR model's tokenizer initialization log to avoid confusion
         # (SALM uses LLM's tokenizer, not ASR's tokenizer)
@@ -428,7 +919,10 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
             model.cfg.perception.preprocessor = asr.cfg.preprocessor
             model.cfg.perception.encoder = asr.cfg.encoder
             model.cfg.perception.output_dim = model.llm.config.hidden_size
+
+        # Use global import from line 24 (no local import needed)
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
         model.perception.load_state_dict(asr.state_dict(), strict=False)
     else:
+        # Mode 3: Random initialization (not supported)
         raise NotImplementedError("Random initialization of speech encoder is not yet supported")
