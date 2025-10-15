@@ -15,7 +15,7 @@ import warnings
 from collections import defaultdict
 from itertools import repeat
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import editdistance
 import torch
@@ -77,6 +77,107 @@ class SALM(LightningModule, HFHubMixin):
 
         self._use_fsdp = False
         self._use_tp = False
+
+        # Validation prediction logging configuration
+        self.log_prediction_valid = cfg.get('log_prediction_valid', False)
+        self.log_prediction_valid_samples = cfg.get('log_prediction_valid_samples', 1)
+
+        # Training prediction logging configuration (separate from validation)
+        self.log_prediction_train = cfg.get('log_prediction_train', False)
+        self.log_prediction_train_interval = cfg.get('log_prediction_train_interval', 100)
+        self.log_prediction_train_samples = cfg.get('log_prediction_train_samples', 1)
+
+    def _format_prediction_log(self, idx, prompt, reference, prediction, wer, step_type="Validation", dataset_name="", audio_len_samples=None):
+        """
+        Format prediction log in a clean, aligned format with token counts.
+
+        Args:
+            idx: Sample index
+            prompt: Input prompt (may contain audio locator tags and formatting)
+            reference: Ground truth text
+            prediction: Model prediction
+            wer: Word error rate
+            step_type: "Training" or "Validation"
+            dataset_name: Name of dataset (for validation)
+            audio_len_samples: Audio length in samples (optional, for audio token count estimation)
+
+        Returns:
+            List of strings, each a clean single-line log entry
+        """
+        lines = []
+
+        # Calculate token counts using tokenizer
+        def count_tokens(text):
+            """Count actual tokens in text using the tokenizer."""
+            if not text or text.strip() == "":
+                return 0
+            # Remove audio locator tags before tokenizing for accurate text token count
+            text_without_audio = text.replace(self.audio_locator_tag, "").strip()
+            if not text_without_audio:
+                return 0
+            tokens = self.tokenizer.text_to_ids(text_without_audio)
+            return len(tokens) if tokens else 0
+
+        # Estimate audio embedding frames from audio length
+        audio_frames = 0
+        if audio_len_samples is not None and audio_len_samples > 0:
+            audio_duration_sec = audio_len_samples / self.sampling_rate
+            audio_frames = int(audio_duration_sec / self.token_equivalent_duration)
+
+        # Clean and prepare text for display
+        if prompt:
+            prompt_display = prompt.replace('\n', ' ').strip()
+            # Remove audio tag for prompt display (will show separately)
+            prompt_display_clean = prompt_display.replace(self.audio_locator_tag, "").strip()
+            # Truncate if too long
+            if len(prompt_display_clean) > 150:
+                prompt_display_clean = prompt_display_clean[:150] + "..."
+        else:
+            prompt_display = ""
+            prompt_display_clean = "(no prompt)"
+
+        # Clean references and predictions
+        ref_display = reference.replace('\n', ' ').strip()
+        pred_display = prediction.replace('\n', ' ').strip()
+
+        # Create full LLM input format (prompt + audio placeholder + reference)
+        if prompt:
+            prompt_for_full = prompt.replace('\n', ' ').strip()
+            # Insert audio locator tag to show where audio embeddings are inserted
+            if self.audio_locator_tag in prompt_for_full:
+                full_llm_input = f"{prompt_for_full} {ref_display}"
+            else:
+                full_llm_input = f"{prompt_for_full} {self.audio_locator_tag} {ref_display}"
+            # Truncate if too long
+            if len(full_llm_input) > 200:
+                full_llm_input = full_llm_input[:200] + "..."
+        else:
+            full_llm_input = ref_display
+
+        # Calculate token counts
+        prompt_tokens = count_tokens(prompt) if prompt else 0
+        ref_tokens = count_tokens(reference)
+        pred_tokens = count_tokens(prediction)
+        # Full LLM input token count = prompt tokens + audio frames + reference tokens
+        full_tokens = prompt_tokens + audio_frames + ref_tokens
+
+        # Format dataset info
+        dataset_info = f" [{dataset_name}]" if dataset_name else ""
+
+        # Define label padding for alignment (longest label is "Full LLM Input" = 14 chars)
+        label_width = 15
+
+        # Build aligned log entries with token counts
+        lines.append("=" * 100)
+        lines.append(f"{step_type} Sample {idx + 1}{dataset_info} | WER: {wer:.2%}")
+        lines.append(f"{'Full LLM Input':<{label_width}}: {full_llm_input} ({full_tokens})")
+        lines.append(f"{'Prompt':<{label_width}}: {prompt_display_clean} ({prompt_tokens})")
+        lines.append(f"{'Audio Token':<{label_width}}: {self.audio_locator_tag} → [audio_embeddings] ({audio_frames})")
+        lines.append(f"{'Ground Truth':<{label_width}}: {ref_display} ({ref_tokens})")
+        lines.append(f"{'Prediction':<{label_width}}: {pred_display} ({pred_tokens})")
+        lines.append("=" * 100)
+
+        return lines
 
     @property
     def text_vocab_size(self):
@@ -256,6 +357,61 @@ class SALM(LightningModule, HFHubMixin):
         self.log("lr", learning_rate, on_step=True, prog_bar=True, logger=False)
         self.log("bs", B, on_step=True, prog_bar=True, logger=False)
 
+        # Training prediction logging (separate from validation)
+        if self.log_prediction_train and (self.trainer.global_step % self.log_prediction_train_interval) == 0:
+            # Generate predictions from logits
+            pred_ids_2d = forward_outputs["logits"].argmax(dim=-1)  # (B, T)
+            target_ids_2d = inputs["target_ids"]  # (B, T)
+
+            # Decode predictions and references
+            num_samples = min(self.log_prediction_train_samples, pred_ids_2d.shape[0])
+            for i in range(num_samples):
+                # Get valid positions (not padding/ignore_index)
+                valid_mask = target_ids_2d[i] != -100
+                if valid_mask.sum() == 0:
+                    continue
+
+                # Extract valid token IDs
+                pred_tokens = pred_ids_2d[i][valid_mask].cpu().tolist()
+                ref_tokens = target_ids_2d[i][valid_mask].cpu().tolist()
+
+                # Decode to text
+                prediction = self.tokenizer.ids_to_text(pred_tokens)
+                reference = self.tokenizer.ids_to_text(ref_tokens)
+
+                # Extract input prompt
+                full_input_ids = batch["input_ids"][i]
+                non_pad_mask = full_input_ids != self.text_pad_id
+                input_tokens = full_input_ids[non_pad_mask].cpu().tolist()
+                full_text = self.tokenizer.ids_to_text(input_tokens)
+
+                # Extract prompt (everything before reference)
+                if reference.strip() in full_text:
+                    prompt = full_text.split(reference.strip())[0].strip()
+                else:
+                    prompt = full_text
+
+                # Compute sample WER
+                h_words = prediction.split()
+                r_words = reference.split()
+                sample_wer = editdistance.eval(h_words, r_words) / len(r_words) if len(r_words) > 0 else 0.0
+
+                # Get audio length for this sample (in samples)
+                audio_len = batch["audio_lens"][i].item() if i < len(batch["audio_lens"]) else None
+
+                # Log using clean format helper with audio length for token count
+                log_lines = self._format_prediction_log(
+                    idx=i,
+                    prompt=prompt,
+                    reference=reference,
+                    prediction=prediction,
+                    wer=sample_wer,
+                    step_type="Training",
+                    audio_len_samples=audio_len
+                )
+                for line in log_lines:
+                    logging.info(line)
+
         return ans
 
     def on_validation_epoch_start(self) -> None:
@@ -345,6 +501,8 @@ class SALM(LightningModule, HFHubMixin):
 
             hypotheses = []
             references = []
+            input_contexts = [] if self.log_prediction_valid else None
+
             for i in range(pred_ids_2d.shape[0]):
                 # Get valid positions (not padding/ignore_index)
                 valid_mask = target_ids_2d[i] != -100
@@ -361,6 +519,59 @@ class SALM(LightningModule, HFHubMixin):
 
                 hypotheses.append(hypothesis)
                 references.append(reference)
+
+                # Extract input context for logging (prompt before response)
+                if self.log_prediction_valid:
+                    # Get the full input_ids for this sample
+                    full_input_ids = dataset_batch["input_ids"][i]
+                    # Find non-padding tokens
+                    non_pad_mask = full_input_ids != self.text_pad_id
+                    input_tokens = full_input_ids[non_pad_mask].cpu().tolist()
+
+                    # Decode the full input (includes prompt + response)
+                    full_text = self.tokenizer.ids_to_text(input_tokens)
+
+                    # Extract just the prompt part (everything before the reference/target)
+                    # The target tokens are at the end, so we can find where they start
+                    if reference.strip() in full_text:
+                        # Split at the reference to get the prompt
+                        prompt_text = full_text.split(reference.strip())[0].strip()
+                    else:
+                        # Fallback: just show what we have
+                        prompt_text = full_text
+
+                    input_contexts.append(prompt_text)
+
+            # Log prediction samples (number of samples controlled by log_prediction_valid_samples)
+            if self.log_prediction_valid and len(hypotheses) > 0:
+                num_samples = min(self.log_prediction_valid_samples, len(hypotheses))
+                for idx in range(num_samples):
+                    # Get prompt for this sample
+                    prompt = input_contexts[idx] if input_contexts and idx < len(input_contexts) else ""
+
+                    # Compute WER for this sample
+                    h_words = hypotheses[idx].split()
+                    r_words = references[idx].split()
+                    sample_wer = (
+                        editdistance.eval(h_words, r_words) / len(r_words) if len(r_words) > 0 else 0.0
+                    )
+
+                    # Get audio length for this sample (in samples)
+                    audio_len = dataset_batch["audio_lens"][idx].item() if idx < len(dataset_batch["audio_lens"]) else None
+
+                    # Log using clean format helper with audio length for token count
+                    log_lines = self._format_prediction_log(
+                        idx=idx,
+                        prompt=prompt,
+                        reference=references[idx],
+                        prediction=hypotheses[idx],
+                        wer=sample_wer,
+                        step_type="Validation",
+                        dataset_name=name,
+                        audio_len_samples=audio_len
+                    )
+                    for line in log_lines:
+                        logging.info(line)
 
             # Compute WER if we have valid samples
             if len(hypotheses) > 0:
@@ -528,6 +739,339 @@ class SALM(LightningModule, HFHubMixin):
 
     def configure_optimizers(self):
         return configure_optimizers(self)
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """
+        PyTorch Lightning hook called before saving checkpoint.
+
+        Ensures complete perception config is saved in checkpoint for offline inference.
+        Perception configs (preprocessor/encoder) are populated during training and
+        must be explicitly saved to make checkpoints self-contained.
+        """
+        from omegaconf import OmegaConf
+
+        # Verify perception module is initialized
+        if not hasattr(self, 'perception') or self.perception is None:
+            logging.warning("Perception module not initialized - checkpoint will have incomplete config.")
+            return
+
+        if not hasattr(self, 'cfg') or 'perception' not in self.cfg:
+            logging.warning("Model config missing perception section - checkpoint will have incomplete config.")
+            return
+
+        perception_cfg = self.cfg.perception
+
+        # Verify config completeness
+        has_preprocessor = 'preprocessor' in perception_cfg and perception_cfg.preprocessor is not None
+        has_encoder = 'encoder' in perception_cfg and perception_cfg.encoder is not None
+        has_output_dim = 'output_dim' in perception_cfg and perception_cfg.output_dim is not None
+
+        if not (has_preprocessor and has_encoder and has_output_dim):
+            logging.warning(
+                f"Incomplete perception config detected: "
+                f"preprocessor={has_preprocessor}, encoder={has_encoder}, output_dim={has_output_dim}"
+            )
+            return
+
+        # Update checkpoint with complete perception config
+        if 'hyper_parameters' in checkpoint and 'cfg' in checkpoint['hyper_parameters']:
+            complete_perception_cfg = OmegaConf.to_container(perception_cfg, resolve=True)
+            checkpoint['hyper_parameters']['cfg']['perception'] = complete_perception_cfg
+
+            logging.debug(
+                f"Saved perception config to checkpoint: "
+                f"preprocessor={complete_perception_cfg.get('preprocessor', {}).get('_target_', 'unknown')}, "
+                f"encoder={complete_perception_cfg.get('encoder', {}).get('_target_', 'unknown')}, "
+                f"output_dim={complete_perception_cfg.get('output_dim', 'unknown')}"
+            )
+        else:
+            logging.warning("Unexpected checkpoint structure - cannot update perception config.")
+
+    def to_config_file(self, path2yaml_file: str):
+        """
+        Saves current model configuration to YAML config file.
+
+        Extracts complete model configuration including perception config
+        and saves it to a YAML file suitable for .nemo format.
+
+        Args:
+            path2yaml_file: Path to yaml file where model configuration will be saved
+        """
+        from omegaconf import OmegaConf
+
+        config_to_save = OmegaConf.create(OmegaConf.to_container(self.cfg, resolve=True))
+
+        # Verify perception configuration if available
+        if hasattr(self, 'perception') and self.perception is not None and 'perception' in config_to_save:
+            perception_cfg = config_to_save.perception
+            has_preprocessor = 'preprocessor' in perception_cfg and perception_cfg.preprocessor is not None
+            has_encoder = 'encoder' in perception_cfg and perception_cfg.encoder is not None
+            has_output_dim = 'output_dim' in perception_cfg and perception_cfg.output_dim is not None
+
+            if not (has_preprocessor and has_encoder and has_output_dim):
+                logging.warning(
+                    f"Incomplete perception config when saving .nemo: "
+                    f"preprocessor={has_preprocessor}, encoder={has_encoder}, output_dim={has_output_dim}"
+                )
+
+        # Save config to YAML file
+        with open(path2yaml_file, 'w', encoding='utf-8') as fout:
+            OmegaConf.save(config=config_to_save, f=fout, resolve=True)
+
+        logging.debug(f"Saved model config to: {path2yaml_file}")
+
+    def save_to(self, save_path: str):
+        """
+        Saves model instance (weights and configuration) into .nemo file.
+
+        .nemo file is a tar archive (uncompressed) containing:
+            - model_config.yaml: Complete model configuration
+            - model_weights.ckpt: Model state_dict
+
+        Note: Follows NeMo's standard approach (SaveRestoreConnector) of using
+        uncompressed tar for fast saving. This prioritizes speed over file size.
+
+        Args:
+            save_path: Path to .nemo file where model instance should be saved
+
+        Example:
+            >>> model.save_to("salm_model.nemo")
+        """
+        import os
+        import tarfile
+        import tempfile
+        import time
+        from pathlib import Path
+        from nemo.utils.app_state import AppState
+        from nemo.utils.get_rank import is_global_rank_zero
+
+        if not isinstance(save_path, Path):
+            save_path = Path(save_path).expanduser().resolve()
+
+        app_state = AppState()
+
+        # Check for model parallel mode
+        if app_state.model_parallel_size is not None and app_state.model_parallel_size > 1:
+            logging.warning(
+                "Model parallel size > 1 detected. .nemo saving may not work correctly. "
+                "Consider using checkpoint format (.ckpt) for model-parallel models."
+            )
+
+        if is_global_rank_zero():
+            if not save_path.parent.exists():
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+
+            logging.info(f"Saving model to .nemo format: {save_path}")
+            start_time = time.time()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Save config
+                config_path = os.path.join(tmpdir, "model_config.yaml")
+                self.to_config_file(config_path)
+
+                # Save state_dict
+                weights_path = os.path.join(tmpdir, "model_weights.ckpt")
+                torch.save(self.state_dict(), weights_path)
+
+                # Create tar archive (uncompressed for speed - same as ASR models)
+                with tarfile.open(save_path, "w:") as tar:
+                    tar.add(config_path, arcname="model_config.yaml")
+                    tar.add(weights_path, arcname="model_weights.ckpt")
+
+            elapsed = time.time() - start_time
+            logging.info(f"Successfully saved model to {save_path} (took {elapsed:.1f}s)")
+        else:
+            logging.debug(f"Rank {app_state.global_rank} skipping save (not rank 0)")
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+    @classmethod
+    def restore_from(
+        cls,
+        restore_path: str,
+        map_location: Optional[torch.device] = None,
+        strict: bool = True,
+    ):
+        """
+        Restores model instance (weights and configuration) from .nemo file.
+
+        Loads a SALM model from a .nemo archive file for offline inference.
+
+        Args:
+            restore_path: Path to .nemo file from which model should be instantiated
+            map_location: Optional torch.device() to map the instantiated model to a device.
+                By default (None), it will select a GPU if available, falling back to CPU otherwise.
+            strict: Passed to load_state_dict. By default True.
+
+        Returns:
+            An instance of SALM model with weights and config restored from .nemo file
+
+        Example:
+            >>> model = SALM.restore_from("salm_model.nemo")
+        """
+        import os
+        import tarfile
+        import tempfile
+        from omegaconf import OmegaConf
+
+        restore_path = os.path.abspath(os.path.expanduser(restore_path))
+
+        if not os.path.exists(restore_path):
+            raise FileNotFoundError(f"Cannot find .nemo file: {restore_path}")
+
+        if map_location is None:
+            map_location = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        logging.info(f"Restoring SALM model from {restore_path}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Extract archive (auto-detect compression)
+            # Try uncompressed first (NeMo 1.7.0+), fallback to gzip if needed
+            tar_mode = "r:"
+            try:
+                with tarfile.open(restore_path, tar_mode) as tar:
+                    tar.extractall(tmpdir)
+            except tarfile.ReadError:
+                # Older checkpoint with gzip compression
+                tar_mode = "r:gz"
+                with tarfile.open(restore_path, tar_mode) as tar:
+                    tar.extractall(tmpdir)
+
+            # Load config
+            config_path = os.path.join(tmpdir, "model_config.yaml")
+            if not os.path.exists(config_path):
+                raise FileNotFoundError(f"model_config.yaml not found in .nemo archive: {restore_path}")
+
+            conf = OmegaConf.load(config_path)
+
+            # Verify perception config
+            if 'perception' in conf:
+                perception_cfg = conf.perception
+                has_preprocessor = 'preprocessor' in perception_cfg
+                has_encoder = 'encoder' in perception_cfg
+                has_output_dim = 'output_dim' in perception_cfg
+
+                if not (has_preprocessor and has_encoder and has_output_dim):
+                    logging.warning(
+                        f"Incomplete perception config in .nemo file: "
+                        f"preprocessor={has_preprocessor}, encoder={has_encoder}, output_dim={has_output_dim}"
+                    )
+
+            # Initialize model
+            cfg_dict = OmegaConf.to_container(conf, resolve=True)
+            cfg_dict['pretrained_weights'] = False  # Use weights from .nemo file
+
+            logging.info("Initializing model...")
+            instance = cls(cfg=cfg_dict)
+
+            # Load weights
+            weights_path = os.path.join(tmpdir, "model_weights.ckpt")
+            if not os.path.exists(weights_path):
+                raise FileNotFoundError(f"model_weights.ckpt not found in .nemo archive: {restore_path}")
+
+            logging.info("Loading weights...")
+            state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
+            instance.load_state_dict(state_dict, strict=strict)
+
+            instance = instance.to(map_location)
+            logging.info(f"Successfully restored model from {restore_path}")
+
+            return instance
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_id: str,
+        *,
+        revision: Optional[str] = None,
+        cache_dir: Optional[Path] = None,
+        force_download: bool = False,
+        proxies: Optional[dict] = None,
+        resume_download: Optional[bool] = None,
+        local_files_only: bool = False,
+        token: Union[str, bool, None] = None,
+        map_location: str = "cpu",
+        strict: bool = False,
+        **model_kwargs,
+    ):
+        """
+        Load a SALM model from various sources.
+
+        This method is automatically used by evaluation scripts (salm_eval.py, salm_generate.py)
+        and supports loading from:
+        1. Local .nemo files (offline inference ready with Solution 1)
+        2. Local .ckpt files (PyTorch Lightning checkpoints with Solution 1)
+        3. HuggingFace Hub model IDs or local directories (original behavior)
+
+        Args:
+            model_id: Can be:
+                - Path to .nemo file (e.g., "model.nemo" or "/path/to/model.nemo")
+                - Path to .ckpt file (e.g., "checkpoint.ckpt" or "/path/to/checkpoint.ckpt")
+                - HuggingFace model ID (e.g., "nvidia/canary-qwen-2.5b")
+                - Path to directory with config.yaml and pytorch_model.bin
+
+        Returns:
+            SALM model instance ready for inference
+
+        Examples:
+            >>> # Load from .nemo file (offline inference)
+            >>> model = SALM.from_pretrained("salm_model.nemo")
+
+            >>> # Load from .ckpt file (offline inference)
+            >>> model = SALM.from_pretrained("checkpoint.ckpt")
+
+            >>> # Load from HuggingFace Hub
+            >>> model = SALM.from_pretrained("nvidia/canary-qwen-2.5b")
+        """
+        import os
+        from pathlib import Path
+
+        # Expand user path and resolve
+        model_path = Path(model_id).expanduser()
+
+        # Check if it's a local file
+        if model_path.exists() and model_path.is_file():
+            suffix = model_path.suffix.lower()
+
+            if suffix == '.nemo':
+                # Load from .nemo file
+                logging.info(f"Loading SALM model from .nemo file: {model_path}")
+                return cls.restore_from(
+                    restore_path=str(model_path),
+                    map_location=torch.device(map_location),
+                    strict=strict,
+                )
+
+            elif suffix == '.ckpt':
+                # Load from PyTorch Lightning checkpoint
+                logging.info(f"Loading SALM model from .ckpt file: {model_path}")
+
+                # Use PyTorch Lightning's load_from_checkpoint
+                model = cls.load_from_checkpoint(
+                    str(model_path),
+                    map_location=map_location,
+                    strict=strict,
+                )
+
+                logging.info(f"Successfully loaded model from checkpoint")
+                return model
+
+        # Not a .nemo or .ckpt file, use original HFHubMixin behavior
+        logging.info(f"Loading SALM model from HuggingFace Hub or directory: {model_id}")
+        return super(SALM, cls)._from_pretrained(
+            model_id=model_id,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            proxies=proxies,
+            resume_download=resume_download,
+            local_files_only=local_files_only,
+            token=token,
+            map_location=map_location,
+            strict=strict,
+            **model_kwargs,
+        )
 
     def configure_model(self) -> None:
         # TODO(pzelasko): refactor into separate module re-usable across models
