@@ -53,7 +53,7 @@ from nemo.utils import logging
 
 
 class SALM(LightningModule, HFHubMixin):
-    def __init__(self, cfg) -> None:
+    def __init__(self, cfg, skip_perception_setup: bool = False) -> None:
         assert isinstance(cfg, dict), (
             "You must pass the config to SALM as a Python dict to support hyperparameter serialization "
             f"in PTL checkpoints (we got: '{type(cfg)=}')."
@@ -73,7 +73,9 @@ class SALM(LightningModule, HFHubMixin):
         maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
-        setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
+        # Skip during restore_from() since weights will be loaded via load_state_dict()
+        if not skip_perception_setup:
+            setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
 
         self._use_fsdp = False
         self._use_tp = False
@@ -948,14 +950,19 @@ class SALM(LightningModule, HFHubMixin):
             # Verify perception config
             if 'perception' in conf:
                 perception_cfg = conf.perception
-                has_preprocessor = 'preprocessor' in perception_cfg
-                has_encoder = 'encoder' in perception_cfg
-                has_output_dim = 'output_dim' in perception_cfg
+                has_preprocessor = 'preprocessor' in perception_cfg and perception_cfg.preprocessor is not None
+                has_encoder = 'encoder' in perception_cfg and perception_cfg.encoder is not None
+                has_output_dim = 'output_dim' in perception_cfg and perception_cfg.output_dim is not None
 
                 if not (has_preprocessor and has_encoder and has_output_dim):
-                    logging.warning(
-                        f"Incomplete perception config in .nemo file: "
-                        f"preprocessor={has_preprocessor}, encoder={has_encoder}, output_dim={has_output_dim}"
+                    raise RuntimeError(
+                        f"Incomplete perception config in .nemo file:\n"
+                        f"  - preprocessor: {'PRESENT' if has_preprocessor else 'MISSING'}\n"
+                        f"  - encoder: {'PRESENT' if has_encoder else 'MISSING'}\n"
+                        f"  - output_dim: {'PRESENT' if has_output_dim else 'MISSING'}\n"
+                        f"\n"
+                        f"This .nemo file was likely created before the checkpoint save enhancement.\n"
+                        f"Please re-train and save the model with the updated code to create a complete .nemo file."
                     )
 
             # Initialize model
@@ -963,7 +970,20 @@ class SALM(LightningModule, HFHubMixin):
             cfg_dict['pretrained_weights'] = False  # Use weights from .nemo file
 
             logging.info("Initializing model...")
-            instance = cls(cfg=cfg_dict)
+            # Skip perception setup - will be initialized from state_dict instead
+            instance = cls(cfg=cfg_dict, skip_perception_setup=True)
+
+            # Initialize perception module from config (structure only, weights loaded below)
+            from nemo.collections.speechlm2.modules import AudioPerceptionModule
+
+            if 'perception' in instance.cfg:
+                logging.info("Initializing perception module from config...")
+                instance.perception = AudioPerceptionModule(instance.cfg.perception).train()
+            else:
+                raise RuntimeError(
+                    "Perception config not found in .nemo file. "
+                    "The .nemo file may be corrupted or from an incompatible version."
+                )
 
             # Load weights
             weights_path = os.path.join(tmpdir, "model_weights.ckpt")
