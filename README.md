@@ -15,47 +15,47 @@ This framework provides production-ready implementations for training SALM model
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    SALM Model Pipeline                       │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  Audio Input (16kHz)                                        │
-│       │                                                      │
-│       ▼                                                      │
-│  ┌─────────────────┐                                       │
-│  │ ASR Encoder     │ (Canary/Parakeet)                     │
-│  │ (Frozen)        │ → Audio Embeddings (1024-dim)         │
-│  └─────────────────┘                                       │
-│       │                                                      │
-│       ▼                                                      │
-│  ┌─────────────────┐                                       │
-│  │ Modality        │ (Conformer Adapter)                   │
-│  │ Adapter         │ → Adapted Audio Embeddings            │
-│  │ (Trainable)     │                                       │
-│  └─────────────────┘                                       │
-│       │                                                      │
-│       ├──────────────────────┐                             │
-│       │                      │                             │
-│       ▼                      ▼                             │
-│  Text Tokens          Audio Embeddings                     │
-│       │                      │                             │
-│       └──────────┬───────────┘                             │
-│                  │                                          │
-│                  ▼                                          │
-│  ┌─────────────────────────────────┐                      │
-│  │ Qwen LLM (Frozen/LoRA)          │                      │
-│  │ • Base LLM: Frozen              │                      │
-│  │ • LoRA Adapters: Trainable      │                      │
-│  │ • Input: [text_emb + audio_emb] │                      │
-│  └─────────────────────────────────┘                      │
-│                  │                                          │
-│                  ▼                                          │
-│            Text Output (ASR Transcription)                 │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│                 SALM Model Pipeline                 │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  Audio Input (16kHz)                                │
+│       │                                             │
+│       ▼                                             │
+│  ┌─────────────────┐                                │
+│  │ ASR Encoder     │ (Canary/Parakeet)              │
+│  │ (Trainable)     │ → Audio Embeddings (1024-dim)  │
+│  └─────────────────┘                                │
+│       │                                             │
+│       ▼                                             │
+│  ┌─────────────────┐                                │
+│  │ Modality        │ (Conformer Adapter)            │
+│  │ Adapter         │ → Adapted Audio Embeddings     │
+│  │ (Trainable)     │                                │
+│  └─────────────────┘                                │
+│       │                                             │
+│       ├──────────────────────┐                      │
+│       │                      │                      │
+│       ▼                      ▼                      │
+│  Text Tokens          Audio Embeddings              │
+│       │                      │                      │
+│       └──────────┬───────────┘                      │
+│                  │                                  │
+│                  ▼                                  │
+│  ┌─────────────────────────────────┐                │
+│  │ Qwen LLM (Frozen/LoRA)          │                │
+│  │ • Base LLM: Frozen              │                │
+│  │ • LoRA Adapters: Trainable      │                │
+│  │ • Input: [text_emb + audio_emb] │                │
+│  └─────────────────────────────────┘                │
+│                  │                                  │
+│                  ▼                                  │
+│            Text Output (ASR Transcription)          │
+│                                                     │
+└─────────────────────────────────────────────────────┘
 
 Key Components:
-- ASR Encoder: Pretrained frozen (Canary-1B, Parakeet-TDT-0.6B)
+- ASR Encoder: Pretrained trainable or frozen (Canary-1B, Parakeet-TDT-0.6B, or customized model)
 - Modality Adapter: Trainable Conformer layers (2-4 layers)
 - LLM: Pretrained frozen with LoRA adapters (q_proj, v_proj)
 - Training: Only adapter + LoRA layers (~1-5% parameters)
@@ -116,7 +116,7 @@ model:
   pretrained_llm: /path/to/Qwen3-1.7B/  # Your Qwen model path
   pretrained_asr: /path/to/pretrained_asr.nemo  # Your ASR encoder
 
-  # Prediction logging (new feature!)
+  # Prediction logging
   log_prediction_train: true
   log_prediction_train_samples: 5      # Log 5 samples every N steps
   log_prediction_train_interval: 50    # Log every 50 steps
@@ -167,8 +167,8 @@ Training Sample 1 | WER: 8.33%
 Full LLM Input : <|im_start|>user Transcribe: <|audio|> <|im_start|>assistant 롯데카드... (67)
 Prompt         : <|im_start|>user Transcribe the following: (10)
 Audio Token    : <|audio|> → [audio_embeddings] (25)
-Ground Truth   : <|im_start|>assistant 롯데카드 0056 8380 7809 9195로... (32)
-Prediction     : <|im_start|>assistant 롯데카드 0056 8380 7809 9195로... (32)
+Ground Truth   : <|im_start|>assistant 롯데카드 1010 2025 5534 9184로... (32)
+Prediction     : <|im_start|>assistant 롯데카드 1010 2025 5534 9184로... (32)
 ====================================================================================================
 ```
 
@@ -543,42 +543,8 @@ model:
 # If using old checkpoints, may need to retrain
 ```
 
-## Citation & References
-
-**SALM Model Architecture:**
-```bibtex
-@misc{nvidia2024canary,
-  title={Canary: Multilingual ASR and Speech Translation},
-  author={NVIDIA},
-  year={2024},
-  url={https://huggingface.co/nvidia/canary-qwen-2.5b}
-}
-```
-
-**NeMo Toolkit:**
-```bibtex
-@misc{nemo2024,
-  title={NVIDIA NeMo},
-  author={NVIDIA},
-  year={2024},
-  url={https://github.com/NVIDIA/NeMo}
-}
-```
-
-## License
-
-This project is based on NVIDIA NeMo and follows the Apache License 2.0.
-
-## Contributing
-
-Contributions are welcome! Please ensure:
-1. Code passes style checks: `python setup.py style --scope . --fix`
-2. Tests pass: `pytest tests/collections/speechlm2/`
-3. Commits are signed: `git commit -s -m "message"`
-
-## Support
-
-For issues and questions:
+## References
+- NeMo Toolkit: https://github.com/NVIDIA-NeMo/NeMo.git
 - NeMo Documentation: https://docs.nvidia.com/nemo-framework/
 - NeMo GitHub Issues: https://github.com/NVIDIA/NeMo/issues
-- SALM Paper/Model: https://huggingface.co/nvidia/canary-qwen-2.5b
+- Canary-Qwen-2.5B Model: https://huggingface.co/nvidia/canary-qwen-2.5b
