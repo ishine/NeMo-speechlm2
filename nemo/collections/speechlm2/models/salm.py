@@ -89,7 +89,16 @@ class SALM(LightningModule, HFHubMixin):
         self.log_prediction_train_interval = cfg.get('log_prediction_train_interval', 100)
         self.log_prediction_train_samples = cfg.get('log_prediction_train_samples', 1)
 
-    def _format_prediction_log(self, idx, prompt, reference, prediction, wer, step_type="Validation", dataset_name="", audio_len_samples=None):
+        # WER Calculator configuration
+        wer_calc_cfg = cfg.get('wer_calculator', {})
+        normalizer = wer_calc_cfg.get('normalizer', 'legacy')
+
+        from nemo.collections.speechlm2.metrics.wer_calculator import create_wer_calculator
+        self.wer_calculator = create_wer_calculator(normalizer)
+
+        logging.info(f"WER Calculator initialized: {normalizer}")
+
+    def _format_prediction_log(self, idx, prompt, reference, prediction, wer, step_type="Validation", dataset_name="", audio_len_samples=None, metric_type="wer"):
         """
         Format prediction log in a clean, aligned format with token counts.
 
@@ -98,10 +107,11 @@ class SALM(LightningModule, HFHubMixin):
             prompt: Input prompt (may contain audio locator tags and formatting)
             reference: Ground truth text
             prediction: Model prediction
-            wer: Word error rate
+            wer: Word error rate (or CER if metric_type='cer')
             step_type: "Training" or "Validation"
             dataset_name: Name of dataset (for validation)
             audio_len_samples: Audio length in samples (optional, for audio token count estimation)
+            metric_type: Type of metric ('wer' or 'cer')
 
         Returns:
             List of strings, each a clean single-line log entry
@@ -170,8 +180,10 @@ class SALM(LightningModule, HFHubMixin):
         label_width = 15
 
         # Build aligned log entries with token counts
+        # Display metric type dynamically (WER or CER)
+        metric_display = metric_type.upper()
         lines.append("=" * 100)
-        lines.append(f"{step_type} Sample {idx + 1}{dataset_info} | WER: {wer:.2%}")
+        lines.append(f"{step_type} Sample {idx + 1}{dataset_info} | {metric_display}: {wer:.2%}")
         lines.append(f"{'Full LLM Input':<{label_width}}: {full_llm_input} ({full_tokens})")
         lines.append(f"{'Prompt':<{label_width}}: {prompt_display_clean} ({prompt_tokens})")
         lines.append(f"{'Audio Token':<{label_width}}: {self.audio_locator_tag} → [audio_embeddings] ({audio_frames})")
@@ -393,10 +405,21 @@ class SALM(LightningModule, HFHubMixin):
                 else:
                     prompt = full_text
 
-                # Compute sample WER
-                h_words = prediction.split()
-                r_words = reference.split()
-                sample_wer = editdistance.eval(h_words, r_words) / len(r_words) if len(r_words) > 0 else 0.0
+                # Extract language/metric metadata from batch (defaults: en, wer)
+                language = batch.get('language', ['en'] * len(batch.get('audios', [])))
+                metric_type = batch.get('metric', ['wer'] * len(batch.get('audios', [])))
+
+                # Get language/metric for this sample (fallback to 'en'/'wer' if not available)
+                sample_language = language[i] if isinstance(language, list) and i < len(language) else (language if isinstance(language, str) else 'en')
+                sample_metric = metric_type[i] if isinstance(metric_type, list) and i < len(metric_type) else (metric_type if isinstance(metric_type, str) else 'wer')
+
+                # Compute sample WER using configured calculator
+                sample_wer, wer_stats = self.wer_calculator.calculate(
+                    predictions=[prediction],
+                    references=[reference],
+                    language=sample_language,
+                    metric_type=sample_metric
+                )
 
                 # Get audio length for this sample (in samples)
                 audio_len = batch["audio_lens"][i].item() if i < len(batch["audio_lens"]) else None
@@ -409,7 +432,8 @@ class SALM(LightningModule, HFHubMixin):
                     prediction=prediction,
                     wer=sample_wer,
                     step_type="Training",
-                    audio_len_samples=audio_len
+                    audio_len_samples=audio_len,
+                    metric_type=sample_metric
                 )
                 for line in log_lines:
                     logging.info(line)
@@ -419,8 +443,9 @@ class SALM(LightningModule, HFHubMixin):
     def on_validation_epoch_start(self) -> None:
         self._partial_val_losses = defaultdict(list)
         self._partial_accuracies = defaultdict(list)
-        self._partial_wer_nums = defaultdict(list)  # WER numerator (edit distance)
-        self._partial_wer_denoms = defaultdict(list)  # WER denominator (word count)
+        self._partial_wer_nums = defaultdict(list)  # Error numerator (edit distance)
+        self._partial_wer_denoms = defaultdict(list)  # Error denominator (word/char count)
+        self._dataset_metrics = {}  # Track metric type (wer/cer) for each dataset
 
     def on_validation_epoch_end(self) -> None:
         # Aggregate val_loss
@@ -439,38 +464,42 @@ class SALM(LightningModule, HFHubMixin):
             accuracies.append(val_acc)
         self.log("val_acc", torch.stack(accuracies).mean(), on_epoch=True, sync_dist=True)
 
-        # Aggregate val_wer with proper distributed training support
+        # Aggregate error metrics (WER/CER) with proper distributed training support
         # Follow the pattern from transformer_bpe_models.py (Lines 529-541)
-        wers = []
+        error_metrics = []
         for name in self._partial_wer_nums.keys():
             # Sum across all validation steps in this GPU
-            wer_num = torch.stack(self._partial_wer_nums[name]).sum()
-            wer_denom = torch.stack(self._partial_wer_denoms[name]).sum()
+            error_num = torch.stack(self._partial_wer_nums[name]).sum()
+            error_denom = torch.stack(self._partial_wer_denoms[name]).sum()
 
             # All-reduce across all GPUs to get global sum
             if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.all_reduce(wer_num, op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.all_reduce(wer_denom, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(error_num, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(error_denom, op=torch.distributed.ReduceOp.SUM)
 
-            # Compute WER = total_edit_distance / total_word_count
-            if wer_denom > 0:
-                wer = wer_num / wer_denom
+            # Compute error rate = total_edit_distance / total_units
+            if error_denom > 0:
+                error_rate = error_num / error_denom
             else:
-                wer = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                error_rate = torch.tensor(0.0, device=self.device, dtype=torch.float32)
 
-            # Log WER (already globally aggregated, so sync_dist=False)
-            self.log(f"val_wer_{name}", wer, on_epoch=True, sync_dist=False)
-            wers.append(wer)
+            # Get metric type for this dataset (default to 'wer' if not tracked)
+            metric_type = self._dataset_metrics.get(name, 'wer')
 
-        # Log overall WER (average across datasets)
-        if len(wers) > 0:
-            self.log("val_wer", torch.stack(wers).mean(), on_epoch=True, sync_dist=False)
+            # Log with dynamic metric name (val_wer_{name} or val_cer_{name})
+            self.log(f"val_{metric_type}_{name}", error_rate, on_epoch=True, sync_dist=False)
+            error_metrics.append(error_rate)
+
+        # Log overall error rate (average across datasets, keep as val_wer for backward compatibility)
+        if len(error_metrics) > 0:
+            self.log("val_wer", torch.stack(error_metrics).mean(), on_epoch=True, sync_dist=False)
 
         # Clear tracking dictionaries
         self._partial_val_losses.clear()
         self._partial_accuracies.clear()
         self._partial_wer_nums.clear()
         self._partial_wer_denoms.clear()
+        self._dataset_metrics.clear()
 
     def validation_step(self, batch: dict, batch_idx: int):
         for name, dataset_batch in batch.items():
@@ -551,11 +580,20 @@ class SALM(LightningModule, HFHubMixin):
                     # Get prompt for this sample
                     prompt = input_contexts[idx] if input_contexts and idx < len(input_contexts) else ""
 
-                    # Compute WER for this sample
-                    h_words = hypotheses[idx].split()
-                    r_words = references[idx].split()
-                    sample_wer = (
-                        editdistance.eval(h_words, r_words) / len(r_words) if len(r_words) > 0 else 0.0
+                    # Extract language/metric metadata from batch (defaults: en, wer)
+                    language = dataset_batch.get('language', ['en'] * len(dataset_batch.get('audios', [])))
+                    metric_type = dataset_batch.get('metric', ['wer'] * len(dataset_batch.get('audios', [])))
+
+                    # Get language/metric for this sample
+                    sample_language = language[idx] if isinstance(language, list) and idx < len(language) else (language if isinstance(language, str) else 'en')
+                    sample_metric = metric_type[idx] if isinstance(metric_type, list) and idx < len(metric_type) else (metric_type if isinstance(metric_type, str) else 'wer')
+
+                    # Compute WER for this sample using configured calculator
+                    sample_wer, wer_stats = self.wer_calculator.calculate(
+                        predictions=[hypotheses[idx]],
+                        references=[references[idx]],
+                        language=sample_language,
+                        metric_type=sample_metric
                     )
 
                     # Get audio length for this sample (in samples)
@@ -570,26 +608,35 @@ class SALM(LightningModule, HFHubMixin):
                         wer=sample_wer,
                         step_type="Validation",
                         dataset_name=name,
-                        audio_len_samples=audio_len
+                        audio_len_samples=audio_len,
+                        metric_type=sample_metric
                     )
                     for line in log_lines:
                         logging.info(line)
 
             # Compute WER if we have valid samples
             if len(hypotheses) > 0:
-                # word_error_rate returns: wer = edit_distance / num_words
-                # We need numerator and denominator for proper distributed aggregation
-                wer_scores = 0
-                wer_words = 0
-                for h, r in zip(hypotheses, references):
-                    r_words = r.split()
-                    wer_words += len(r_words)
-                    # Compute edit distance
-                    h_words = h.split()
-                    wer_scores += editdistance.eval(h_words, r_words)
+                # Extract language/metric metadata from batch (defaults: en, wer)
+                language = dataset_batch.get('language', ['en'] * len(hypotheses))
+                metric_type = dataset_batch.get('metric', ['wer'] * len(hypotheses))
 
-                wer_num = torch.tensor(wer_scores, device=self.device, dtype=torch.float32)
-                wer_denom = torch.tensor(wer_words, device=self.device, dtype=torch.float32)
+                # Ensure we have lists
+                if not isinstance(language, list):
+                    language = [language] * len(hypotheses)
+                if not isinstance(metric_type, list):
+                    metric_type = [metric_type] * len(hypotheses)
+
+                # Calculate WER using configured calculator for the entire batch
+                # We need numerator and denominator for proper distributed aggregation
+                _, batch_stats = self.wer_calculator.calculate(
+                    predictions=hypotheses,
+                    references=references,
+                    language=language[0] if language else 'en',  # Use first sample's language
+                    metric_type=metric_type[0] if metric_type else 'wer'  # Use first sample's metric
+                )
+
+                wer_num = torch.tensor(batch_stats['total_errors'], device=self.device, dtype=torch.float32)
+                wer_denom = torch.tensor(batch_stats['total_units'], device=self.device, dtype=torch.float32)
             else:
                 wer_num = torch.tensor(0.0, device=self.device, dtype=torch.float32)
                 wer_denom = torch.tensor(0.0, device=self.device, dtype=torch.float32)
@@ -598,6 +645,10 @@ class SALM(LightningModule, HFHubMixin):
             self._partial_val_losses[name].append(loss)
             self._partial_wer_nums[name].append(wer_num)
             self._partial_wer_denoms[name].append(wer_denom)
+
+            # Store metric type for this dataset (use first sample's metric)
+            if name not in self._dataset_metrics and len(hypotheses) > 0:
+                self._dataset_metrics[name] = metric_type[0] if metric_type else 'wer'
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()

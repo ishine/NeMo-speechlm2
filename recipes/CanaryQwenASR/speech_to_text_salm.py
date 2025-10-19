@@ -19,7 +19,7 @@ logging.getLogger("nemo.collections.asr").setLevel(logging.WARNING)
 import torch
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import TQDMProgressBar
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 
 # Import SALM components directly to avoid peft dependency issue with duplex models
 from nemo.collections.speechlm2.models.salm import SALM
@@ -245,9 +245,11 @@ def main(cfg: DictConfig):
             # Create input_cfg list
             input_cfg_list = []
             for shar_item in shar_paths:
-                if isinstance(shar_item, list) and len(shar_item) >= 1:
+                if isinstance(shar_item, (list, ListConfig)) and len(shar_item) >= 1:
                     shar_dir = shar_item[0]
                     weight = shar_item[1] if len(shar_item) >= 2 else 1.0
+                    language = shar_item[2] if len(shar_item) >= 3 else 'en'
+                    metric = shar_item[3] if len(shar_item) >= 4 else 'wer'
 
                     input_cfg_list.append({
                         'type': 'lhotse_as_conversation',
@@ -258,11 +260,15 @@ def main(cfg: DictConfig):
                         'prompt_format': cfg.model.prompt_format,  # Add prompt_format here
                         'tags': {
                             'context': context_prompt,
+                            'lang': language,
+                            'metric': metric,
                         }
                     })
 
             # Only update if we have valid configs
             if input_cfg_list:
+                if rank == 0:
+                    logging.info(f"Converted {len(input_cfg_list)} shar_path entries to input_cfg format")
                 cfg.data.train_ds.input_cfg = input_cfg_list
                 # Remove the old shar_path configuration
                 del cfg.data.train_ds.shar_path

@@ -152,6 +152,26 @@ class SALMDataset(torch.utils.data.Dataset):
         audios, audio_lens, conversations = collate_conversation_audio_fault_tolerant(processed_conversations)
         if not conversations:
             return None
+
+        # Extract language and metric metadata from Cut.custom for each conversation
+        languages = []
+        metrics = []
+        for conv in conversations:
+            # Find the first AudioTurn to extract metadata from its Cut
+            language = 'en'  # Default
+            metric = 'wer'   # Default
+
+            for turn in conv.turns:
+                if isinstance(turn, AudioTurn) and hasattr(turn, 'cut'):
+                    # Extract from Cut.custom dict if available
+                    if hasattr(turn.cut, 'custom') and turn.cut.custom:
+                        language = turn.cut.custom.get('lang', turn.cut.custom.get('language', 'en'))
+                        metric = turn.cut.custom.get('metric', turn.cut.custom.get('metric_type', 'wer'))
+                    break  # Use first audio turn's metadata
+
+            languages.append(language)
+            metrics.append(metric)
+
         return {
             "audios": audios,
             "audio_lens": audio_lens,
@@ -160,6 +180,8 @@ class SALMDataset(torch.utils.data.Dataset):
                 [getattr(c, "mask", torch.empty(0)) for c in conversations], padding_value=0
             ).to(torch.bool),
             "conversations": drop_in_memory_data(conversations),
+            "language": languages,
+            "metric": metrics,
         }
 
 
@@ -193,14 +215,14 @@ def default_multimodal_conversation_prompt_format_fn(
         [
             {
                 "role": turn.role,
-                "slots": {"message": turn.value if isinstance(turn, TextTurn) else turn.audio_locator_tag},
+                "slots": {"message": (turn.value if isinstance(turn, TextTurn) else turn.audio_locator_tag) or ""},
             }
             for turn in example.turns
         ],
         key=lambda turn: turn["role"],
     )
     turns = [
-        {"role": role, "slots": {"message": " ".join(t["slots"]["message"] for t in turn_grp)}}
+        {"role": role, "slots": {"message": " ".join(t["slots"]["message"] for t in turn_grp if t["slots"]["message"])}}
         for role, turn_grp in turns
     ]
     if hasattr(example, "system_prompt"):
@@ -218,14 +240,14 @@ def canary_qwen_multimodal_conversation_prompt_format_fn(
         [
             {
                 "role": turn.role,
-                "slots": {"message": turn.value if isinstance(turn, TextTurn) else turn.audio_locator_tag},
+                "slots": {"message": (turn.value if isinstance(turn, TextTurn) else turn.audio_locator_tag) or ""},
             }
             for turn in example.turns
         ],
         key=lambda turn: turn["role"],
     )
     turns = [
-        {"role": role, "slots": {"message": " ".join(t["slots"]["message"] for t in turn_grp)}}
+        {"role": role, "slots": {"message": " ".join(t["slots"]["message"] for t in turn_grp if t["slots"]["message"])}}
         for role, turn_grp in turns
     ]
     if hasattr(example, "system_prompt"):

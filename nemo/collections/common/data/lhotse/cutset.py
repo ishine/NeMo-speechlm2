@@ -485,9 +485,9 @@ def cut_to_conversation(
         AudioTurn(cut=cut, role="user", audio_locator_tag=audio_locator_tag, text=cut.supervisions[0].text),
         TextTurn(value=cut.supervisions[0].text, role="assistant"),
     ]
-    if hasattr(cut, "context"):
+    if hasattr(cut, "context") and cut.context:  # Only add if context is non-empty
         turns = [TextTurn(value=cut.context, role="user")] + turns
-    if hasattr(cut, "system_prompt"):
+    if hasattr(cut, "system_prompt") and cut.system_prompt:  # Only add if system_prompt is non-empty
         turns = [TextTurn(value=cut.system_prompt, role="system")] + turns
     return NeMoMultimodalConversation(
         id=cut.id,
@@ -584,7 +584,7 @@ def s2s_cut_to_conversation(
             logging.warning(f"Speaker '{turn_speaker}' not found in user or agent roles for cut {cut.id}")
             return FailedConversion()
         idx += 1
-    if hasattr(cut, "system_prompt") and all(t.role != "system" for t in turns):
+    if hasattr(cut, "system_prompt") and cut.system_prompt and all(t.role != "system" for t in turns):
         turns = [TextTurn(value=cut.system_prompt, role="system")] + turns
 
     return NeMoMultimodalConversation(
