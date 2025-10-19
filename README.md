@@ -8,7 +8,8 @@ This framework provides production-ready implementations for training SALM model
 
 - **SALM Architecture**: Audio embeddings → LLM → Text generation
 - **Efficient Training**: LoRA fine-tuning, gradient accumulation, mixed precision
-- **Advanced Logging**: Token-aware prediction logging with audio frame counts
+- **Advanced Logging**: Token-aware prediction logging with dynamic WER/CER metrics
+- **Multilingual Support**: HuggingFace Open ASR Leaderboard-compliant evaluation
 - **Flexible I/O**: Checkpoint (.ckpt) and NeMo (.nemo) format support
 - **Lhotse Integration**: Bucketing, multimodal sampling, shar format
 
@@ -126,7 +127,10 @@ model:
 data:
   train_ds:
     shar_path:
-      - [/path/to/train_shar, 1.0]  # [path, sampling_weight]
+      # Format: [path, weight, language, metric]
+      - [/path/to/librispeech_shar, 1.0, "en", "wer"]
+      - [/path/to/commonvoice_ja_shar, 0.5, "ja", "cer"]
+      - [/path/to/aishell_shar, 0.5, "zh", "cer"]
 
   validation_ds:
     datasets:
@@ -158,25 +162,38 @@ python recipes/CanaryQwenASR/speech_to_text_salm.py \
 
 ### 3. Enhanced Prediction Logging
 
-The framework includes advanced prediction logging with token counts:
+The framework includes advanced prediction logging with token counts and dynamic metric display:
 
-**Example Training Log Output:**
+**Example Training Log Output (WER for English):**
 ```
 ====================================================================================================
-Training Sample 1 | WER: 8.33%
-Full LLM Input : <|im_start|>user Transcribe: <|audio|> <|im_start|>assistant 롯데카드... (67)
-Prompt         : <|im_start|>user Transcribe the following: (10)
-Audio Token    : <|audio|> → [audio_embeddings] (25)
-Ground Truth   : <|im_start|>assistant 롯데카드 1010 2025 5534 9184로... (32)
-Prediction     : <|im_start|>assistant 롯데카드 1010 2025 5534 9184로... (32)
+Training Sample 1 | WER: 3.24%
+Full LLM Input : <|im_start|>user\nTranscribe the following: <|audio|><|im_end|> <|im_start|>assistant\nThe quick brown fox jumps...<|im_end|> (178)
+Prompt         : <|im_start|>user\nTranscribe the following: <|im_end|> <|im_start|>assistant\n (42)
+Audio Token    : <|audio|> → [audio_embeddings] (127)
+Ground Truth   : The quick brown fox jumps over the lazy dog (45)
+Prediction     : The quick brown fox jumps over the lazy dog (45)
+====================================================================================================
+```
+
+**Example Validation Log Output (CER for Japanese):**
+```
+====================================================================================================
+Validation Sample 1 [commonvoice_ja] | CER: 8.45%
+Full LLM Input : <|im_start|>user\nTranscribe the following: <|audio|><|im_end|> <|im_start|>assistant\n今日はいい天気ですね<|im_end|> (156)
+Prompt         : <|im_start|>user\nTranscribe the following: <|im_end|> <|im_start|>assistant\n (42)
+Audio Token    : <|audio|> → [audio_embeddings] (98)
+Ground Truth   : 今日はいい天気ですね (16)
+Prediction     : 今日はいい天気です (15)
 ====================================================================================================
 ```
 
 Features:
-- **Aligned format**: Clean vertical alignment for readability
-- **Token counts**: Shows actual tokenizer counts for text, estimated frames for audio
+- **Dynamic Metrics**: Automatically displays WER (word-based languages) or CER (character-based languages)
+- **Aligned Format**: Clean vertical alignment for readability
+- **Token Counts**: Shows actual tokenizer counts for text, estimated frames for audio
 - **Full LLM Input**: Complete input structure including audio placeholder location
-- **Audio Token Line**: Shows `<|audio|>` → `[audio_embeddings]` transformation
+- **Dataset Name**: Shows validation dataset name for multi-dataset evaluation
 
 ### 4. Model Checkpointing & Saving
 
@@ -225,9 +242,20 @@ python examples/speechlm2/salm_eval.py \
 ```
 
 **Evaluation Metrics:**
-- **WER (Word Error Rate)**: Primary ASR metric
+- **WER/CER**: Dynamic metric selection (WER for word-based, CER for character-based languages)
+  - HuggingFace Open ASR Leaderboard protocol-compliant normalization
+  - Multilingual text normalization (English, Chinese, Japanese, Korean, etc.)
 - **Token-level Accuracy**: Per-token prediction accuracy
 - **Loss**: Validation loss
+
+**PyTorch Lightning Metrics:**
+```python
+# Metrics are logged with dynamic names based on metric type
+val_wer_librispeech_test_clean: 0.0324  # WER for English datasets
+val_cer_commonvoice_ja: 0.0845          # CER for Japanese datasets
+val_cer_aishell: 0.0523                 # CER for Chinese datasets
+val_wer: 0.0412                         # Overall average (backward compatible)
+```
 
 ### 6. Inference & Generation
 
@@ -276,6 +304,10 @@ model:
   pretrained_llm: /path/to/Qwen3-1.7B/
   pretrained_asr: /path/to/encoder.nemo
   pretrained_weights: true  # Load pretrained weights (false for random init)
+
+  # WER/CER Calculator (HuggingFace Open ASR Leaderboard compliant)
+  wer_calculator:
+    normalizer: "openasrleaderboard"  # or "legacy" for backward compatibility
 
   # LoRA settings (parameter-efficient fine-tuning)
   lora:
@@ -360,6 +392,9 @@ NeMo-speechlm2/
 │   │   │   │   └── salm.py      # Core SALM model (enhanced logging)
 │   │   │   ├── data/
 │   │   │   │   └── salm_dataset.py  # Lhotse dataset loader
+│   │   │   ├── metrics/         # Evaluation metrics (NEW)
+│   │   │   │   ├── wer_calculator.py   # WER/CER calculator
+│   │   │   │   └── normalization.py    # Multilingual text normalization
 │   │   │   ├── modules/
 │   │   │   │   └── perception.py    # Audio encoder + adapter
 │   │   │   └── parts/
@@ -409,10 +444,14 @@ exp_manager:
 
 ### 2. Enhanced Prediction Logging
 
-Token-aware logging for debugging and analysis:
+Token-aware logging with dynamic WER/CER metrics for debugging and analysis:
 
 ```yaml
 model:
+  # WER/CER Calculator (HuggingFace Open ASR Leaderboard compliant)
+  wer_calculator:
+    normalizer: "openasrleaderboard"  # Protocol-compliant normalization
+
   # Training logging
   log_prediction_train: true
   log_prediction_train_samples: 5
@@ -424,10 +463,12 @@ model:
 ```
 
 **Features:**
-- Aligned formatting for readability
-- Token counts (text tokens + audio frames)
-- Full LLM input structure visualization
-- Audio embedding frame counts
+- **Dynamic Metrics**: Automatically displays WER (word-based) or CER (character-based) based on language
+- **Multilingual Normalization**: HuggingFace Open ASR Leaderboard protocol-compliant
+- **Aligned Formatting**: Clean vertical alignment for readability
+- **Token Counts**: Shows actual tokenizer counts for text, estimated frames for audio
+- **Full LLM Input**: Complete input structure visualization including audio placeholder location
+- **Dataset Context**: Shows validation dataset name for multi-dataset evaluation
 
 ### 3. Flexible Model Loading
 
