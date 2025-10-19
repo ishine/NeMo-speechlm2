@@ -4,6 +4,13 @@
 name: "SALM-Canary-Qwen-2.5B"
 
 model:
+  # WER Calculator Configuration
+  wer_calculator:
+    # normalizer: "legacy" or "open_asr_leaderboard"
+    # - "legacy": Simple editdistance.eval() without text normalization (backward compatible)
+    # - "open_asr_leaderboard": HuggingFace Open ASR Leaderboard compliant with full normalization
+    normalizer: "open_asr_leaderboard"
+
   # Training log prediction
   log_prediction_train: true
   log_prediction_train_samples: 5
@@ -13,14 +20,14 @@ model:
   log_prediction_valid_samples: 20
 
   # Pre-trained model settings
-  pretrained_llm: /path/to/Qwen3-1.7B/
-  pretrained_asr: /path/to/pretrained_asr.nemo
+  pretrained_llm: Qwen/Qwen3-1.7B # or downloaded directory path: /path/to/Qwen3-1.7B/
+  pretrained_asr: nvidia/canary-1b-v2 # or downloaded model path: /path/to/pretrained_asr.nemo
   pretrained_weights: True  # Use pretrained weights (False for random init)
 
   # Freeze parameters - ONLY freeze LLM, keep encoder and projection trainable
   freeze_params:
     - "^llm\\..+$"  # Freeze entire LLM
-    - "^embed_tokens\\..+$"
+    - "^embed_tokens\\..+$"  # Freeze LLM embeddings
   prevent_freeze_params:
     - ".*lora_.*"  # Keep all LoRA parameters trainable
 
@@ -28,7 +35,7 @@ model:
   prompt_format: canary_qwen  # Use canary_qwen format for ASR with Qwen model
   audio_locator_tag: "<|audio|>"  # Placeholder for audio in text
 
-  # LoRA configuration
+  # LoRA configuration - REQUIRED as per official training
   lora:
     task_type: CAUSAL_LM
     r: 128  # LoRA rank
@@ -55,7 +62,7 @@ model:
 
   # Learning rate scheduler
   lr_scheduler:
-    _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
     warmup_steps: 1000
     warmup_ratio: null
     min_lr: 1e-6
@@ -106,8 +113,10 @@ data:
     # This automatically converts ASR-only shar datasets to conversational format (auto-converted to input_cfg by speech_to_text_salm.py)
     use_lhotse: true
     shar_path:
-      - [/path/to/dataset1, weight1]
-      - [/path/to/dataset2, weight2]
+      - [/path/to/dataset1, weight1, 'en-US', 'wer']
+      - [/path/to/dataset2, weight2, 'ko-KR', 'wer']
+      - [/path/to/dataset3, weight3, 'ja-JP', 'cer']
+      - [/path/to/dataset4, weight4, 'zh-CN', 'cer']
 
     # Batching configuration
     use_multimodal_sampling: true
@@ -116,7 +125,7 @@ data:
     min_tokens: 2
     max_tokens: 1024
     bucket_duration_bins: [99, 110, 117, 124, 184, 247, 324, 391, 457, 520, 555, 579, 600, 618, 638, 1024]
-    bucket_batch_size: [69, 64, 60, 40, 28, 22, 16, 14, 12, 11, 10, 6, 4, 4, 4, 2]
+    bucket_batch_size: [96, 84, 72, 56, 36, 32, 28, 24, 20, 18, 16, 12, 10, 8, 6, 3]
     use_bucketing: true
     num_buckets: 16
     bucket_buffer_size: 20000
